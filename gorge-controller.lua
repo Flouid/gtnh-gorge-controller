@@ -14,7 +14,6 @@ local sides = require("sides")
 -- config
 -- ============================================================
 
-VERBOSE = true
 DEBUG = false
 BATCH_MULTIPLIER = 2^16
 BATCH_SIZE = {
@@ -148,7 +147,7 @@ end
 -- Networking & Auto updates
 -- ============================================================
 
-local VERSION = "1.1.4"
+local VERSION = "1.1.5"
 local UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/develop/VERSION"
 local UPDATE_SCRIPT_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/develop/gorge-controller.lua"
 
@@ -313,13 +312,6 @@ end
 -- cycle steps
 -- ============================================================
 
--- Step 0: Print a seperator line to make it easier to see where each cycle starts in the logs
-local function printCycleSeparator()
-    if VERBOSE then
-        print("\n============================================================\n")
-    end
-end
-
 -- Step 1: Check for the exoticizer to output some combination of items and fluids, then return them
 local function checkForOutputs()
     local items = OutputInterface.getItemsInNetwork()
@@ -364,10 +356,6 @@ end
 
 -- Step 2: Flush the outputs to main, we do not need them anymore (and prep for next cycle)
 local function flushOutputs()
-    if VERBOSE then
-        print("Flushing outputs to main...")
-    end
-
     RedstoneIO.setOutput({
         [sides.bottom] = 15,
         [sides.top] = 15,
@@ -391,10 +379,6 @@ end
 
 -- Step 3: Use the outputs from step 1 to calculate the specific plasma types and amounts needed to complete the recipe
 local function calculatePlasmaDemand(items, fluids)
-    if VERBOSE then
-        print("Calculating plasma demand...")
-    end
-
     local demand = {}
     for _, item in pairs(items) do
         local plasma = PLASMAS[item.label]
@@ -441,10 +425,6 @@ local function orderPlasmaFabrication(missing)
 end
 
 local function ensurePlasmaAvailable(demand)
-    if VERBOSE then
-        print("Ensuring plasma availability...")
-    end
-
     local missing = getMissingPlasma(demand)
     if next(missing) == nil then return true end
 
@@ -453,10 +433,6 @@ end
 
 -- Step 5: Feed the plasma into the exoticizer to supply the demand from step 3 and complete the cycle
 local function feedPlasma(demand)
-    if VERBOSE then
-        print("Feeding plasma to exoticizer...")
-    end
-
     local slot = 1
     for plasma, info in pairs(demand) do
         setPatternInput(PlasmaInterface, slot, {name = plasma}, "FLUID", info.amount)
@@ -477,7 +453,13 @@ local STATE_WAIT_OUTPUT = 1
 local STATE_WAIT_OUTPUT_EMPTY = 2
 local STATE_WAIT_PLASMA = 3
 
-local state = STATE_WAIT_OUTPUT
+local STATE_DISPLAY = {
+    [STATE_WAIT_OUTPUT] = "Waiting for exoticizer outputs",
+    [STATE_WAIT_OUTPUT_EMPTY] = "Flushing outputs to main",
+    [STATE_WAIT_PLASMA] = "Waiting for plasma"
+}
+
+local state = nil
 local cycleItems = nil
 local cycleFluids = nil
 local demand = nil
@@ -485,6 +467,20 @@ local missingPlasma = nil
 local fabricatorCraft = nil
 local fabricatorRetryAt = nil
 local exoticizerCraft = nil
+
+local function render()
+    local text = "QGP: " .. STATE_DISPLAY[state]
+    text = text:sub(1, DisplayWidth)
+
+    GPU.set(1, 1, text .. string.rep(" ", DisplayWidth - #text))
+end
+
+local function setState(newState)
+    if state == newState then return end
+
+    state = newState
+    render()
+end
 
 local function subscribeOutput()
     PlasmaInterface.setFluidEventSubscription(false)
@@ -527,19 +523,13 @@ local function pullDebounced(timeout)
 end
 
 local function beginCycle()
-    state = STATE_WAIT_OUTPUT
+    setState(STATE_WAIT_OUTPUT)
     cycleItems = nil
     cycleFluids = nil
     demand = nil
     missingPlasma = nil
     fabricatorCraft = nil
     fabricatorRetryAt = nil
-
-    printCycleSeparator()
-
-    if VERBOSE then
-        print("Waiting for exoticizer outputs...")
-    end
 end
 
 local function finishPlasmaWait()
@@ -576,7 +566,7 @@ local function advanceQGP(eventName)
 
         cycleItems = items
         cycleFluids = fluids
-        state = STATE_WAIT_OUTPUT_EMPTY
+        setState(STATE_WAIT_OUTPUT_EMPTY)
         flushOutputs()
         return
     end
@@ -599,7 +589,7 @@ local function advanceQGP(eventName)
         missingPlasma = missing
         fabricatorCraft = craft
         fabricatorRetryAt = computer.uptime() + 1
-        state = STATE_WAIT_PLASMA
+        setState(STATE_WAIT_PLASMA)
 
         subscribePlasma()
 
@@ -657,6 +647,9 @@ FabricatorRecipe = nil
 PlasmaRecipe = nil
 FabricatorPatternSize = 0
 PlasmaPatternSize = 0
+GPU = nil
+DisplayWidth = 0
+DisplayHeight = 0
 
 local function startup()
     if DEBUG then
@@ -688,6 +681,12 @@ local function startup()
     local address = component.list("redstone", true)()
     assert(address, "could not find redstone IO")
     RedstoneIO = component.proxy(address)
+
+    address = component.list("gpu", true)()
+    assert(address, "could not find GPU")
+    GPU = component.proxy(address)
+    DisplayWidth, DisplayHeight = GPU.getResolution()
+    GPU.fill(1, 1, DisplayWidth, DisplayHeight, " ")
 
     subscribeOutput()
 end
