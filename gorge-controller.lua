@@ -148,7 +148,7 @@ end
 -- Networking & Auto updates
 -- ============================================================
 
-local VERSION = "1.1.1"
+local VERSION = "1.1.2"
 local UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/develop/VERSION"
 local UPDATE_SCRIPT_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/develop/gorge-controller.lua"
 
@@ -479,6 +479,32 @@ local function subscribePlasma()
     PlasmaInterface.setFluidEventSubscription(true)
 end
 
+local function pullDebounced(timeout)
+    local eventName
+
+    if timeout then
+        eventName = event.pull(timeout)
+    else
+        eventName = event.pull()
+    end
+
+    if eventName ~= "network_item_changed"
+        and eventName ~= "network_fluid_changed" then
+        return eventName
+    end
+
+    local deadline = computer.uptime() + 0.05
+
+    while true do
+        local remaining = deadline - computer.uptime()
+        if remaining <= 0 then break end
+
+        event.pull(remaining)
+    end
+
+    return eventName
+end
+
 local function beginCycle()
     state = STATE_WAIT_OUTPUT
     cycleItems = nil
@@ -653,12 +679,7 @@ while true do
             timeout = fabricatorRetryAt - computer.uptime()
         end
 
-        local eventName
-        if timeout then
-            eventName = event.pull(timeout)
-        else
-            eventName = event.pull()
-        end
+        local eventName = pullDebounced(timeout)
 
         if eventName == "network_item_changed" or eventName == "network_fluid_changed" then
             advanceQGP(eventName)
