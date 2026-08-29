@@ -148,7 +148,7 @@ end
 -- Networking & Auto updates
 -- ============================================================
 
-local VERSION = "1.1.2"
+local VERSION = "1.1.4"
 local UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/develop/VERSION"
 local UPDATE_SCRIPT_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/develop/gorge-controller.lua"
 
@@ -219,11 +219,10 @@ end
 -- ============================================================
 
 local function checkOutputEmpty()
-    local items = OutputInterface.getItemsInNetwork()
     local fluids = OutputInterface.getFluidsInNetwork()
-
     if next(fluids) then return false end
 
+    local items = OutputInterface.getItemsInNetwork()
     for _, item in pairs(items) do
         if item.label ~= "Output" then return false end
     end
@@ -232,11 +231,15 @@ local function checkOutputEmpty()
 end
 
 local function getMissingPlasma(demand)
-    local missing = {}
+    local stock = {}
 
+    for _, fluid in pairs(PlasmaInterface.getFluidsInNetwork()) do
+        stock[fluid.name] = fluid.amount
+    end
+
+    local missing = {}
     for plasma, info in pairs(demand) do
-        local stock = PlasmaInterface.getFluidInNetwork(plasma)
-        if not stock or stock.amount < info.amount then
+        if (stock[plasma] or 0) < info.amount then
             missing[plasma] = info
         end
     end
@@ -244,13 +247,20 @@ local function getMissingPlasma(demand)
     return missing
 end
 
-local function clearPatternInputs(interface)
+local function getPatternSize(interface)
     local pattern = assert(interface.getInterfacePattern(1), "no pattern in interface")
+    local size = 0
 
     for slot in pairs(pattern.inputs) do
-        if slot ~= 1 then
-            interface.clearInterfacePatternInput(1, slot)
-        end
+        if slot > size then size = slot end
+    end
+
+    return size
+end
+
+local function clearUnusedPatternInputs(interface, first, previousSize)
+    for slot = first, previousSize do
+        interface.clearInterfacePatternInput(1, slot)
     end
 end
 
@@ -269,9 +279,7 @@ local function setPatternInput(interface, slot, source, type, amount)
     end
 end
 
-local function orderPattern(interface, label)
-    local recipe = interface.getCraftables({label = label})[1]
-    assert(recipe, "could not find craftable pattern: " .. label)
+local function orderPattern(recipe)
     return recipe.request(1)
 end
 
@@ -315,19 +323,30 @@ end
 -- Step 1: Check for the exoticizer to output some combination of items and fluids, then return them
 local function checkForOutputs()
     local items = OutputInterface.getItemsInNetwork()
-    local fluids = OutputInterface.getFluidsInNetwork()
+    local count = 0
 
     for i, item in pairs(items) do
-        if item.label == "Output" then items[i] = nil end
-    end
-
-    for i, fluid in pairs(fluids) do
-        if fluid.label == "Degenerate Quark Gluon Plasma" then
-            fluids[i] = nil
+        if item.label == "Output" then
+            items[i] = nil
+        else
+            count = count + 1
         end
     end
 
-    if next(items) or next(fluids) then
+    local fluids = {}
+    if count < 7 then
+        fluids = OutputInterface.getFluidsInNetwork()
+
+        for i, fluid in pairs(fluids) do
+            if fluid.label == "Degenerate Quark Gluon Plasma" then
+                fluids[i] = nil
+            else
+                count = count + 1
+            end
+        end
+    end
+
+    if count == 7 then
         if DEBUG then
             print("Outputs detected:")
             for _, item in pairs(items) do
@@ -409,15 +428,16 @@ end
 
 -- Step 4: Compare stocks to demand and create a pattern requesting the missing plasma types from the fabricator
 local function orderPlasmaFabrication(missing)
-    clearPatternInputs(FabricatorInterface)
-
     local slot = 1
     for _, info in pairs(missing) do
         setPatternInput(FabricatorInterface, slot, info.source, info.type, BATCH_SIZE[info.type])
         slot = slot + 1
     end
 
-    return orderPattern(FabricatorInterface, "Fabricator")
+    clearUnusedPatternInputs(FabricatorInterface, slot, FabricatorPatternSize)
+    FabricatorPatternSize = slot - 1
+
+    return orderPattern(FabricatorRecipe)
 end
 
 local function ensurePlasmaAvailable(demand)
@@ -437,15 +457,16 @@ local function feedPlasma(demand)
         print("Feeding plasma to exoticizer...")
     end
 
-    clearPatternInputs(PlasmaInterface)
-
     local slot = 1
     for plasma, info in pairs(demand) do
         setPatternInput(PlasmaInterface, slot, {name = plasma}, "FLUID", info.amount)
         slot = slot + 1
     end
 
-    return orderPattern(PlasmaInterface, "Plasma")
+    clearUnusedPatternInputs(PlasmaInterface, slot, PlasmaPatternSize)
+    PlasmaPatternSize = slot - 1
+
+    return orderPattern(PlasmaRecipe)
 end
 
 -- ============================================================
@@ -528,13 +549,16 @@ local function finishPlasmaWait()
 
     subscribeOutput()
 
-    exoticizerCraft = feedPlasma(demand)
+    local craft = feedPlasma(demand)
+    if DEBUG then exoticizerCraft = craft end
+
     beginCycle()
 end
-local function checkExoticizerCraft()
-    if not exoticizerCraft or exoticizerCraft.isComputing() then return end
 
-    if DEBUG and exoticizerCraft.hasFailed() then
+local function checkExoticizerCraft()
+    if not DEBUG or not exoticizerCraft or exoticizerCraft.isComputing() then return end
+
+    if exoticizerCraft.hasFailed() then
         print("WARNING: AE2 reported craft failure, waiting for exoticizer...")
     end
 
@@ -617,7 +641,7 @@ local function handleFabricatorTimer()
         return
     end
 
-    fabricatorCraft = orderPlasmaFabrication(missingPlasma)
+    fabricatorCraft = orderPattern(FabricatorRecipe)
     fabricatorRetryAt = computer.uptime() + 1
 end
 
@@ -629,6 +653,10 @@ OutputInterface = nil
 PlasmaInterface = nil
 FabricatorInterface = nil
 RedstoneIO = nil
+FabricatorRecipe = nil
+PlasmaRecipe = nil
+FabricatorPatternSize = 0
+PlasmaPatternSize = 0
 
 local function startup()
     if DEBUG then
@@ -647,6 +675,15 @@ local function startup()
 
     FabricatorInterface = findMarkedInterface("Fabricator")
     assert(FabricatorInterface, "could not find gorge fabricator")
+
+    FabricatorPatternSize = getPatternSize(FabricatorInterface)
+    PlasmaPatternSize = getPatternSize(PlasmaInterface)
+
+    FabricatorRecipe = FabricatorInterface.getCraftables({label = "Fabricator"})[1]
+    assert(FabricatorRecipe, "could not find fabricator pattern")
+
+    PlasmaRecipe = PlasmaInterface.getCraftables({label = "Plasma"})[1]
+    assert(PlasmaRecipe, "could not find plasma pattern")
 
     local address = component.list("redstone", true)()
     assert(address, "could not find redstone IO")
