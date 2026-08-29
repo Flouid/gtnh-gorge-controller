@@ -7,6 +7,7 @@
 
 local component = require("component")
 local computer = require("computer")
+local sides = require("sides")
 
 -- ============================================================
 -- config
@@ -148,7 +149,7 @@ end
 -- Networking & Auto updates
 -- ============================================================
 
-local VERSION = "0.3.2"
+local VERSION = "0.3.5"
 local UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/VERSION"
 local UPDATE_SCRIPT_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/gorge-controller.lua"
 
@@ -191,13 +192,8 @@ end
 local update_applied = false;
 
 local function checkForUpdate()
-    local cacheBust = tostring(computer.uptime())
-
-    local remoteVersionStr, _ =
-        httpGet(UPDATE_VERSION_URL .. "?v=" .. cacheBust)
-
-    local remoteVersion =
-        remoteVersionStr:match("^%s*(%d+%.%d+%.%d+)%s*$")
+    local remoteVersionStr, _ = httpGet(UPDATE_VERSION_URL)
+    local remoteVersion = remoteVersionStr:match("^%s*(%d+%.%d+%.%d+)%s*$")
 
     if DEBUG then
         print("Current version: " .. VERSION)
@@ -209,8 +205,7 @@ local function checkForUpdate()
         return
     end
 
-    local newScript, _ =
-        httpGet(UPDATE_SCRIPT_URL .. "?v=" .. cacheBust)
+    local newScript, _ = httpGet(UPDATE_SCRIPT_URL)
 
     local file = io.open(SCRIPT_PATH, "w")
     file:write(newScript)
@@ -218,7 +213,7 @@ local function checkForUpdate()
 
     print("Updated to version " .. remoteVersion .. ", restarting...")
     update_applied = true
-    os.sleep(3)
+    os.sleep(2)
 end
 
 -- ============================================================
@@ -284,6 +279,13 @@ end
 -- cycle steps
 -- ============================================================
 
+-- Step 0: Print a seperator line to make it easier to see where each cycle starts in the logs
+local function printCycleSeparator()
+    if VERBOSE then
+        print("\n============================================================\n")
+    end
+end
+
 -- Step 1: Wait for the exoticizer to output some combination of items and fluids, then return them
 local function waitForOutputs()
     if VERBOSE then
@@ -296,6 +298,12 @@ local function waitForOutputs()
         for i, item in pairs(items) do
             if item.label == "Output" then
                 items[i] = nil
+            end
+        end
+
+        for i, fluid in pairs(fluids) do
+            if fluid.label == "Degenerate Quark Gluon Plasma" then
+                fluids[i] = nil
             end
         end
 
@@ -318,7 +326,34 @@ local function waitForOutputs()
     end
 end
 
--- Step 2: Use the outputs from step 1 to calculate the specific plasma types and amounts needed to complete the recipe
+-- Step 2: Flush the outputs to main, we do not need them anymore (and prep for next cycle)
+local function flushOutputs()
+    if VERBOSE then
+        print("Flushing outputs to main...")
+    end
+
+    RedstoneIO.setOutput({
+        [sides.bottom] = 15,
+        [sides.top] = 15,
+        [sides.north] = 15,
+        [sides.south] = 15,
+        [sides.west] = 15,
+        [sides.east] = 15
+    })
+
+    os.sleep(0.1)
+
+    RedstoneIO.setOutput({
+        [sides.bottom] = 0,
+        [sides.top] = 0,
+        [sides.north] = 0,
+        [sides.south] = 0,
+        [sides.west] = 0,
+        [sides.east] = 0
+    })
+end
+
+-- Step 3: Use the outputs from step 1 to calculate the specific plasma types and amounts needed to complete the recipe
 local function calculatePlasmaDemand(items, fluids)
     if VERBOSE then
         print("Calculating plasma demand...")
@@ -355,7 +390,7 @@ local function calculatePlasmaDemand(items, fluids)
     return demand
 end
 
--- Step 3: Poll the current plasma stocks and build a hashmap for comparison with the demands from step 2
+-- Step 4: Poll the current plasma stocks and build a hashmap for comparison with the demands from step 3
 local function getPlasmaStock()
     if VERBOSE then
         print("Polling plasma stock...")
@@ -369,7 +404,7 @@ local function getPlasmaStock()
     return stock
 end
 
--- Step 4: Compare stocks to demand and create a pattern requesting the missing plasma types from the fabricator
+-- Step 5: Compare stocks to demand and create a pattern requesting the missing plasma types from the fabricator
 local function ensurePlasmaAvailable(stock, demand)
     if VERBOSE then
         print("Ensuring plasma availability...")
@@ -396,7 +431,7 @@ local function ensurePlasmaAvailable(stock, demand)
     end
 end
 
--- STEP 5: Feed the plasma into the exoticizer to supply the demand from step 2 and complete the cycle
+-- STEP 6: Feed the plasma into the exoticizer to supply the demand from step 3 and complete the cycle
 local function feedPlasma(demand)
     if VERBOSE then
         print("Feeding plasma to exoticizer...")
@@ -429,6 +464,7 @@ end
 OutputInterface = nil
 PlasmaInterface = nil
 FabricatorInterface = nil
+RedstoneIO = nil
 
 local function startup()
     if DEBUG then
@@ -437,7 +473,7 @@ local function startup()
         end
     end
 
-    print("Discovering subnets...")
+    print("Discovering components...")
 
     OutputInterface = findMarkedInterface("Output")
     assert(OutputInterface, "could not find gorge output subnet")
@@ -447,10 +483,17 @@ local function startup()
 
     FabricatorInterface = findMarkedInterface("Fabricator")
     assert(FabricatorInterface, "could not find gorge fabricator")
+
+    local address = component.list("redstone", true)()
+    assert(address, "could not find redstone IO")
+
+    RedstoneIO = component.proxy(address)
 end
 
 local function runOneCycle()
+    printCycleSeparator()
     local items, fluids = waitForOutputs()
+    flushOutputs()
     local demand = calculatePlasmaDemand(items, fluids)
     local stock = getPlasmaStock()
     ensurePlasmaAvailable(stock, demand)
@@ -470,8 +513,6 @@ end
 
 startup()
 
-runOneCycle()
-
--- while true do
---     runOneCycle()
--- end
+while true do
+    runOneCycle()
+end
