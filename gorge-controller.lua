@@ -7,13 +7,13 @@
 
 local component = require("component")
 local computer = require("computer")
+local event = require("event")
 local sides = require("sides")
 
 -- ============================================================
 -- config
 -- ============================================================
 
-VERBOSE = true
 DEBUG = false
 BATCH_MULTIPLIER = 2^16
 BATCH_SIZE = {
@@ -147,9 +147,9 @@ end
 -- Networking & Auto updates
 -- ============================================================
 
-local VERSION = "1.0.1"
-local UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/VERSION"
-local UPDATE_SCRIPT_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/gorge-controller.lua"
+local VERSION = "1.1.5"
+local UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/develop/VERSION"
+local UPDATE_SCRIPT_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/develop/gorge-controller.lua"
 
 local function httpRequest(url, postData, headers)
   local internetAddress
@@ -204,7 +204,6 @@ local function checkForUpdate()
     end
 
     local newScript, _ = httpGet(UPDATE_SCRIPT_URL)
-
     local file = io.open(SCRIPT_PATH, "w")
     file:write(newScript)
     file:close()
@@ -219,34 +218,48 @@ end
 -- ============================================================
 
 local function checkOutputEmpty()
-    local items = OutputInterface.getItemsInNetwork()
     local fluids = OutputInterface.getFluidsInNetwork()
-
     if next(fluids) then return false end
+
+    local items = OutputInterface.getItemsInNetwork()
     for _, item in pairs(items) do
         if item.label ~= "Output" then return false end
     end
+
     return true
 end
 
 local function getMissingPlasma(demand)
+    local stock = {}
+
+    for _, fluid in pairs(PlasmaInterface.getFluidsInNetwork()) do
+        stock[fluid.name] = fluid.amount
+    end
+
     local missing = {}
     for plasma, info in pairs(demand) do
-        local stock = PlasmaInterface.getFluidInNetwork(plasma)
-        if not stock or stock.amount < info.amount then
+        if (stock[plasma] or 0) < info.amount then
             missing[plasma] = info
         end
     end
+
     return missing
 end
 
-local function clearPatternInputs(interface)
+local function getPatternSize(interface)
     local pattern = assert(interface.getInterfacePattern(1), "no pattern in interface")
+    local size = 0
 
     for slot in pairs(pattern.inputs) do
-        if slot ~= 1 then
-            interface.clearInterfacePatternInput(1, slot)
-        end
+        if slot > size then size = slot end
+    end
+
+    return size
+end
+
+local function clearUnusedPatternInputs(interface, first, previousSize)
+    for slot = first, previousSize do
+        interface.clearInterfacePatternInput(1, slot)
     end
 end
 
@@ -265,15 +278,8 @@ local function setPatternInput(interface, slot, source, type, amount)
     end
 end
 
-local function tryOrderPattern(interface, label)
-    local recipe = interface.getCraftables({label = label})[1]
-    assert(recipe, "could not find craftable pattern: " .. label)
-
-    local craft = recipe.request(1)
-    while craft.isComputing() do os.sleep(0.1) end
-    if craft.hasFailed() then return nil end
-
-    return craft
+local function orderPattern(recipe)
+    return recipe.request(1)
 end
 
 local function printMaterialShortages(missing)
@@ -302,80 +308,54 @@ local function printMaterialShortages(missing)
     end
 end
 
-local function waitForPlasma(demand)
-    while true do
-        local ready = true
-
-        for plasma, info in pairs(demand) do
-            local fluid = PlasmaInterface.getFluidInNetwork(plasma)
-
-            if not fluid or fluid.amount < info.amount then
-                ready = false
-                break
-            end
-        end
-
-        if ready then return end
-        os.sleep(0.1)
-    end
-end
-
 -- ============================================================
 -- cycle steps
 -- ============================================================
 
--- Step 0: Print a seperator line to make it easier to see where each cycle starts in the logs
-local function printCycleSeparator()
-    if VERBOSE then
-        print("\n============================================================\n")
-    end
-end
+-- Step 1: Check for the exoticizer to output some combination of items and fluids, then return them
+local function checkForOutputs()
+    local items = OutputInterface.getItemsInNetwork()
+    local count = 0
 
--- Step 1: Wait for the exoticizer to output some combination of items and fluids, then return them
-local function waitForOutputs()
-    if VERBOSE then
-        print("Waiting for exoticizer outputs...")
-    end
-
-    while true do
-        local items = OutputInterface.getItemsInNetwork()
-        local fluids = OutputInterface.getFluidsInNetwork()
-
-        for i, item in pairs(items) do
-            if item.label == "Output" then items[i] = nil end
+    for i, item in pairs(items) do
+        if item.label == "Output" then
+            items[i] = nil
+        else
+            count = count + 1
         end
+    end
+
+    local fluids = {}
+    if count < 7 then
+        fluids = OutputInterface.getFluidsInNetwork()
 
         for i, fluid in pairs(fluids) do
             if fluid.label == "Degenerate Quark Gluon Plasma" then
                 fluids[i] = nil
+            else
+                count = count + 1
+            end
+        end
+    end
+
+    if count == 7 then
+        if DEBUG then
+            print("Outputs detected:")
+            for _, item in pairs(items) do
+                print("\t" .. item.size .. " " .. item.label)
+            end
+
+            for _, fluid in pairs(fluids) do
+                print("\t" .. fluid.amount .. "L " .. fluid.label)
             end
         end
 
-        if next(items) or next(fluids) then
-            if DEBUG then
-                print("Outputs detected:")
-                for _, item in pairs(items) do
-                    print("\t" .. item.size .. " " .. item.label)
-                end
-
-                for _, fluid in pairs(fluids) do
-                    print("\t" .. fluid.amount .. "L " .. fluid.label)
-                end
-            end
-
-            return items, fluids
-        end
-
-        os.sleep(0.5)
+        return items, fluids
     end
 end
 
 -- Step 2: Flush the outputs to main, we do not need them anymore (and prep for next cycle)
 local function flushOutputs()
-    if VERBOSE then
-        print("Flushing outputs to main...")
-    end
-
     RedstoneIO.setOutput({
         [sides.bottom] = 15,
         [sides.top] = 15,
@@ -384,9 +364,9 @@ local function flushOutputs()
         [sides.west] = 15,
         [sides.east] = 15
     })
+end
 
-    while not checkOutputEmpty() do os.sleep(0.1) end
-
+local function finishFlushOutputs()
     RedstoneIO.setOutput({
         [sides.bottom] = 0,
         [sides.top] = 0,
@@ -399,10 +379,6 @@ end
 
 -- Step 3: Use the outputs from step 1 to calculate the specific plasma types and amounts needed to complete the recipe
 local function calculatePlasmaDemand(items, fluids)
-    if VERBOSE then
-        print("Calculating plasma demand...")
-    end
-
     local demand = {}
     for _, item in pairs(items) do
         local plasma = PLASMAS[item.label]
@@ -435,51 +411,228 @@ local function calculatePlasmaDemand(items, fluids)
 end
 
 -- Step 4: Compare stocks to demand and create a pattern requesting the missing plasma types from the fabricator
-local function ensurePlasmaAvailable(demand)
-    if VERBOSE then
-        print("Ensuring plasma availability...")
-    end
-
-    local missing = getMissingPlasma(demand)
-    if next(missing) == nil then return end
-
-    clearPatternInputs(FabricatorInterface)
-
+local function orderPlasmaFabrication(missing)
     local slot = 1
     for _, info in pairs(missing) do
         setPatternInput(FabricatorInterface, slot, info.source, info.type, BATCH_SIZE[info.type])
         slot = slot + 1
     end
 
-    while true do
-        local craft = tryOrderPattern(FabricatorInterface, "Fabricator")
-        if craft then break end
+    clearUnusedPatternInputs(FabricatorInterface, slot, FabricatorPatternSize)
+    FabricatorPatternSize = slot - 1
 
-        printMaterialShortages(missing)
-        os.sleep(60)
-    end
+    return orderPattern(FabricatorRecipe)
+end
 
-    waitForPlasma(demand)
+local function ensurePlasmaAvailable(demand)
+    local missing = getMissingPlasma(demand)
+    if next(missing) == nil then return true end
+
+    return false, missing, orderPlasmaFabrication(missing)
 end
 
 -- Step 5: Feed the plasma into the exoticizer to supply the demand from step 3 and complete the cycle
 local function feedPlasma(demand)
-    if VERBOSE then
-        print("Feeding plasma to exoticizer...")
-    end
-
-    clearPatternInputs(PlasmaInterface)
-
     local slot = 1
     for plasma, info in pairs(demand) do
         setPatternInput(PlasmaInterface, slot, {name = plasma}, "FLUID", info.amount)
         slot = slot + 1
     end
 
-    local craft = tryOrderPattern(PlasmaInterface, "Plasma")
-    if DEBUG and not craft then
+    clearUnusedPatternInputs(PlasmaInterface, slot, PlasmaPatternSize)
+    PlasmaPatternSize = slot - 1
+
+    return orderPattern(PlasmaRecipe)
+end
+
+-- ============================================================
+-- event state machine
+-- ============================================================
+
+local STATE_WAIT_OUTPUT = 1
+local STATE_WAIT_OUTPUT_EMPTY = 2
+local STATE_WAIT_PLASMA = 3
+
+local STATE_DISPLAY = {
+    [STATE_WAIT_OUTPUT] = "Waiting for exoticizer outputs",
+    [STATE_WAIT_OUTPUT_EMPTY] = "Flushing outputs to main",
+    [STATE_WAIT_PLASMA] = "Waiting for plasma"
+}
+
+local state = nil
+local cycleItems = nil
+local cycleFluids = nil
+local demand = nil
+local missingPlasma = nil
+local fabricatorCraft = nil
+local fabricatorRetryAt = nil
+local exoticizerCraft = nil
+
+local function render()
+    local text = "QGP: " .. STATE_DISPLAY[state]
+    text = text:sub(1, DisplayWidth)
+
+    GPU.set(1, 1, text .. string.rep(" ", DisplayWidth - #text))
+end
+
+local function setState(newState)
+    if state == newState then return end
+
+    state = newState
+    render()
+end
+
+local function subscribeOutput()
+    PlasmaInterface.setFluidEventSubscription(false)
+
+    OutputInterface.setItemEventSubscription(true)
+    OutputInterface.setFluidEventSubscription(true)
+end
+
+local function subscribePlasma()
+    OutputInterface.setItemEventSubscription(false)
+    OutputInterface.setFluidEventSubscription(false)
+
+    PlasmaInterface.setFluidEventSubscription(true)
+end
+
+local function pullDebounced(timeout)
+    local eventName
+
+    if timeout then
+        eventName = event.pull(timeout)
+    else
+        eventName = event.pull()
+    end
+
+    if eventName ~= "network_item_changed"
+        and eventName ~= "network_fluid_changed" then
+        return eventName
+    end
+
+    local deadline = computer.uptime() + 0.05
+
+    while true do
+        local remaining = deadline - computer.uptime()
+        if remaining <= 0 then break end
+
+        event.pull(remaining)
+    end
+
+    return eventName
+end
+
+local function beginCycle()
+    setState(STATE_WAIT_OUTPUT)
+    cycleItems = nil
+    cycleFluids = nil
+    demand = nil
+    missingPlasma = nil
+    fabricatorCraft = nil
+    fabricatorRetryAt = nil
+end
+
+local function finishPlasmaWait()
+    fabricatorCraft = nil
+    fabricatorRetryAt = nil
+    missingPlasma = nil
+
+    subscribeOutput()
+
+    local craft = feedPlasma(demand)
+    if DEBUG then exoticizerCraft = craft end
+
+    beginCycle()
+end
+
+local function checkExoticizerCraft()
+    if not DEBUG or not exoticizerCraft or exoticizerCraft.isComputing() then return end
+
+    if exoticizerCraft.hasFailed() then
         print("WARNING: AE2 reported craft failure, waiting for exoticizer...")
     end
+
+    exoticizerCraft = nil
+end
+
+local function advanceQGP(eventName)
+    checkExoticizerCraft()
+
+    if state == STATE_WAIT_OUTPUT then
+        if eventName and eventName ~= "network_item_changed" and eventName ~= "network_fluid_changed" then return end
+
+        local items, fluids = checkForOutputs()
+        if not items then return end
+
+        cycleItems = items
+        cycleFluids = fluids
+        setState(STATE_WAIT_OUTPUT_EMPTY)
+        flushOutputs()
+        return
+    end
+
+    if state == STATE_WAIT_OUTPUT_EMPTY then
+        if eventName ~= "network_item_changed" and eventName ~= "network_fluid_changed" then return end
+        if not checkOutputEmpty() then return end
+
+        finishFlushOutputs()
+        demand = calculatePlasmaDemand(cycleItems, cycleFluids)
+        cycleItems = nil
+        cycleFluids = nil
+
+        local ready, missing, craft = ensurePlasmaAvailable(demand)
+        if ready then
+            finishPlasmaWait()
+            return
+        end
+
+        missingPlasma = missing
+        fabricatorCraft = craft
+        fabricatorRetryAt = computer.uptime() + 1
+        setState(STATE_WAIT_PLASMA)
+
+        subscribePlasma()
+
+        missingPlasma = getMissingPlasma(demand)
+        if next(missingPlasma) == nil then
+            finishPlasmaWait()
+        end
+
+        return
+    end
+
+    if state == STATE_WAIT_PLASMA then
+        if eventName ~= "network_fluid_changed" then return end
+
+        missingPlasma = getMissingPlasma(demand)
+        if next(missingPlasma) == nil then
+            finishPlasmaWait()
+        end
+    end
+end
+
+local function handleFabricatorTimer()
+    if state ~= STATE_WAIT_PLASMA or not fabricatorRetryAt then return end
+
+    if fabricatorCraft then
+        if fabricatorCraft.isComputing() then
+            fabricatorRetryAt = computer.uptime() + 1
+            return
+        end
+
+        if fabricatorCraft.hasFailed() then
+            printMaterialShortages(missingPlasma)
+            fabricatorCraft = nil
+            fabricatorRetryAt = computer.uptime() + 60
+        else
+            fabricatorRetryAt = nil
+        end
+
+        return
+    end
+
+    fabricatorCraft = orderPattern(FabricatorRecipe)
+    fabricatorRetryAt = computer.uptime() + 1
 end
 
 -- ============================================================
@@ -490,6 +643,13 @@ OutputInterface = nil
 PlasmaInterface = nil
 FabricatorInterface = nil
 RedstoneIO = nil
+FabricatorRecipe = nil
+PlasmaRecipe = nil
+FabricatorPatternSize = 0
+PlasmaPatternSize = 0
+GPU = nil
+DisplayWidth = 0
+DisplayHeight = 0
 
 local function startup()
     if DEBUG then
@@ -509,19 +669,26 @@ local function startup()
     FabricatorInterface = findMarkedInterface("Fabricator")
     assert(FabricatorInterface, "could not find gorge fabricator")
 
+    FabricatorPatternSize = getPatternSize(FabricatorInterface)
+    PlasmaPatternSize = getPatternSize(PlasmaInterface)
+
+    FabricatorRecipe = FabricatorInterface.getCraftables({label = "Fabricator"})[1]
+    assert(FabricatorRecipe, "could not find fabricator pattern")
+
+    PlasmaRecipe = PlasmaInterface.getCraftables({label = "Plasma"})[1]
+    assert(PlasmaRecipe, "could not find plasma pattern")
+
     local address = component.list("redstone", true)()
     assert(address, "could not find redstone IO")
-
     RedstoneIO = component.proxy(address)
-end
 
-local function runOneCycle()
-    printCycleSeparator()
-    local items, fluids = waitForOutputs()
-    flushOutputs()
-    local demand = calculatePlasmaDemand(items, fluids)
-    ensurePlasmaAvailable(demand)
-    feedPlasma(demand)
+    address = component.list("gpu", true)()
+    assert(address, "could not find GPU")
+    GPU = component.proxy(address)
+    DisplayWidth, DisplayHeight = GPU.getResolution()
+    GPU.fill(1, 1, DisplayWidth, DisplayHeight, " ")
+
+    subscribeOutput()
 end
 
 -- ============================================================
@@ -536,7 +703,22 @@ if update_applied then
 end
 
 startup()
+beginCycle()
+advanceQGP()
 
 while true do
-    runOneCycle()
+    if fabricatorRetryAt and computer.uptime() >= fabricatorRetryAt then
+        handleFabricatorTimer()
+    else
+        local timeout = nil
+        if fabricatorRetryAt then
+            timeout = fabricatorRetryAt - computer.uptime()
+        end
+
+        local eventName = pullDebounced(timeout)
+
+        if eventName == "network_item_changed" or eventName == "network_fluid_changed" then
+            advanceQGP(eventName)
+        end
+    end
 end
