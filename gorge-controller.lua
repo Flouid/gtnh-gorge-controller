@@ -149,7 +149,7 @@ end
 -- Networking & Auto updates
 -- ============================================================
 
-local VERSION = "0.3.5"
+local VERSION = "0.3.6"
 local UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/VERSION"
 local UPDATE_SCRIPT_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/gorge-controller.lua"
 
@@ -220,11 +220,11 @@ end
 -- helpers
 -- ============================================================
 
-local function getMissingPlasma(stock, demand)
+local function getMissingPlasma(demand)
     local missing = {}
     for plasma, info in pairs(demand) do
-        local available = stock[plasma] or 0
-        if available < info.amount then
+        local stock = PlasmaInterface.getFluidInNetwork(plasma)
+        if not stock or stock.amount < info.amount then
             missing[plasma] = info
         end
     end
@@ -273,6 +273,27 @@ local function tryOrderPattern(interface, label)
     end
 
     return craft
+end
+
+local function waitForPlasma(demand)
+    while true do
+        local ready = true
+
+        for plasma, info in pairs(demand) do
+            local fluid = PlasmaInterface.getFluidInNetwork(plasma)
+
+            if not fluid or fluid.amount < info.amount then
+                ready = false
+                break
+            end
+        end
+
+        if ready then
+            return
+        end
+
+        os.sleep(0.1)
+    end
 end
 
 -- ============================================================
@@ -390,27 +411,13 @@ local function calculatePlasmaDemand(items, fluids)
     return demand
 end
 
--- Step 4: Poll the current plasma stocks and build a hashmap for comparison with the demands from step 3
-local function getPlasmaStock()
-    if VERBOSE then
-        print("Polling plasma stock...")
-    end
-
-    local stock = {}
-
-    for _, fluid in pairs(PlasmaInterface.getFluidsInNetwork()) do
-        stock[fluid.name] = fluid.amount
-    end
-    return stock
-end
-
--- Step 5: Compare stocks to demand and create a pattern requesting the missing plasma types from the fabricator
-local function ensurePlasmaAvailable(stock, demand)
+-- Step 4: Compare stocks to demand and create a pattern requesting the missing plasma types from the fabricator
+local function ensurePlasmaAvailable(demand)
     if VERBOSE then
         print("Ensuring plasma availability...")
     end
 
-    local missing = getMissingPlasma(stock, demand)
+    local missing = getMissingPlasma(demand)
     if next(missing) == nil then
         return
     end
@@ -426,12 +433,10 @@ local function ensurePlasmaAvailable(stock, demand)
     local craft = tryOrderPattern(FabricatorInterface, "Fabricator")
     assert(craft, "failed to order plasma pattern!")
 
-    while not craft.isDone() do
-        os.sleep(0.1)
-    end
+    waitForPlasma(demand)
 end
 
--- STEP 6: Feed the plasma into the exoticizer to supply the demand from step 3 and complete the cycle
+-- Step 5: Feed the plasma into the exoticizer to supply the demand from step 3 and complete the cycle
 local function feedPlasma(demand)
     if VERBOSE then
         print("Feeding plasma to exoticizer...")
@@ -446,15 +451,7 @@ local function feedPlasma(demand)
     end
 
     local craft = tryOrderPattern(PlasmaInterface, "Plasma")
-
-    while not craft do
-        os.sleep(0.1)
-        craft = tryOrderPattern(PlasmaInterface, "Plasma")
-    end
-
-    while not craft.isDone() do
-        os.sleep(0.1)
-    end
+    assert(craft, "failed to order exoticizer pattern!")
 end
 
 -- ============================================================
@@ -495,8 +492,7 @@ local function runOneCycle()
     local items, fluids = waitForOutputs()
     flushOutputs()
     local demand = calculatePlasmaDemand(items, fluids)
-    local stock = getPlasmaStock()
-    ensurePlasmaAvailable(stock, demand)
+    ensurePlasmaAvailable(demand)
     feedPlasma(demand)
 end
 
