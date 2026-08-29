@@ -113,9 +113,7 @@ local function findMarkedInterface(label)
     local ok, items = pcall(proxy.getItemsInNetwork)
     if ok and items then
       for _, item in pairs(items) do
-        if item.label == label then
-          return proxy
-        end
+        if item.label == label then return proxy end
       end
     end
   end
@@ -149,7 +147,7 @@ end
 -- Networking & Auto updates
 -- ============================================================
 
-local VERSION = "0.3.6"
+local VERSION = "1.0.1"
 local UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/VERSION"
 local UPDATE_SCRIPT_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/gorge-controller.lua"
 
@@ -220,6 +218,17 @@ end
 -- helpers
 -- ============================================================
 
+local function checkOutputEmpty()
+    local items = OutputInterface.getItemsInNetwork()
+    local fluids = OutputInterface.getFluidsInNetwork()
+
+    if next(fluids) then return false end
+    for _, item in pairs(items) do
+        if item.label ~= "Output" then return false end
+    end
+    return true
+end
+
 local function getMissingPlasma(demand)
     local missing = {}
     for plasma, info in pairs(demand) do
@@ -234,12 +243,10 @@ end
 local function clearPatternInputs(interface)
     local pattern = assert(interface.getInterfacePattern(1), "no pattern in interface")
 
-    local count = 0
     for slot in pairs(pattern.inputs) do
-        if count ~= 0 then
+        if slot ~= 1 then
             interface.clearInterfacePatternInput(1, slot)
         end
-        count = count + 1
     end
 end
 
@@ -263,16 +270,36 @@ local function tryOrderPattern(interface, label)
     assert(recipe, "could not find craftable pattern: " .. label)
 
     local craft = recipe.request(1)
-
-    while craft.isComputing() do
-        os.sleep(0.1)
-    end
-
-    if craft.hasFailed() then
-        return nil
-    end
+    while craft.isComputing() do os.sleep(0.1) end
+    if craft.hasFailed() then return nil end
 
     return craft
+end
+
+local function printMaterialShortages(missing)
+    print("Craft failed. Current material shortages:")
+
+    for _, info in pairs(missing) do
+        local source = info.source
+        local needed = BATCH_SIZE[info.type]
+        local stored
+
+        if info.type == "ITEM" then
+            stored = FabricatorInterface.getItemInNetwork(
+                source.name,
+                source.damage
+            )
+        else
+            stored = FabricatorInterface.getFluidInNetwork(source.name)
+        end
+
+        local available = stored and (stored.size or stored.amount) or 0
+
+        if available < needed then
+            print("\t" .. source.label .. ": "
+                .. available .. " / " .. needed)
+        end
+    end
 end
 
 local function waitForPlasma(demand)
@@ -288,10 +315,7 @@ local function waitForPlasma(demand)
             end
         end
 
-        if ready then
-            return
-        end
-
+        if ready then return end
         os.sleep(0.1)
     end
 end
@@ -312,14 +336,13 @@ local function waitForOutputs()
     if VERBOSE then
         print("Waiting for exoticizer outputs...")
     end
+
     while true do
         local items = OutputInterface.getItemsInNetwork()
         local fluids = OutputInterface.getFluidsInNetwork()
 
         for i, item in pairs(items) do
-            if item.label == "Output" then
-                items[i] = nil
-            end
+            if item.label == "Output" then items[i] = nil end
         end
 
         for i, fluid in pairs(fluids) do
@@ -362,7 +385,7 @@ local function flushOutputs()
         [sides.east] = 15
     })
 
-    os.sleep(0.1)
+    while not checkOutputEmpty() do os.sleep(0.1) end
 
     RedstoneIO.setOutput({
         [sides.bottom] = 0,
@@ -418,9 +441,7 @@ local function ensurePlasmaAvailable(demand)
     end
 
     local missing = getMissingPlasma(demand)
-    if next(missing) == nil then
-        return
-    end
+    if next(missing) == nil then return end
 
     clearPatternInputs(FabricatorInterface)
 
@@ -430,8 +451,13 @@ local function ensurePlasmaAvailable(demand)
         slot = slot + 1
     end
 
-    local craft = tryOrderPattern(FabricatorInterface, "Fabricator")
-    assert(craft, "failed to order plasma pattern!")
+    while true do
+        local craft = tryOrderPattern(FabricatorInterface, "Fabricator")
+        if craft then break end
+
+        printMaterialShortages(missing)
+        os.sleep(60)
+    end
 
     waitForPlasma(demand)
 end
@@ -451,7 +477,9 @@ local function feedPlasma(demand)
     end
 
     local craft = tryOrderPattern(PlasmaInterface, "Plasma")
-    assert(craft, "failed to order exoticizer pattern!")
+    if DEBUG and not craft then
+        print("WARNING: AE2 reported craft failure, waiting for exoticizer...")
+    end
 end
 
 -- ============================================================
