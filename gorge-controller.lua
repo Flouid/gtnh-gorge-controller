@@ -15,6 +15,10 @@ local computer = require("computer")
 VERBOSE = true
 DEBUG = false
 BATCH_MULTIPLIER = 2^16
+BATCH_SIZE = {
+    ITEM = BATCH_MULTIPLIER,
+    FLUID = 1000 * BATCH_MULTIPLIER
+}
 PLASMAS = {
     ["Aluminium Dust"] = "plasma.aluminium",
     ["Americium Dust"] = "plasma.americium",
@@ -144,7 +148,7 @@ end
 -- Networking & Auto updates
 -- ============================================================
 
-local VERSION = "0.2.10"
+local VERSION = "0.3.2"
 local UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/VERSION"
 local UPDATE_SCRIPT_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/gorge-controller.lua"
 
@@ -195,7 +199,7 @@ local function checkForUpdate()
     local remoteVersion =
         remoteVersionStr:match("^%s*(%d+%.%d+%.%d+)%s*$")
 
-    if VERBOSE then
+    if DEBUG then
         print("Current version: " .. VERSION)
         print("Latest version: " .. (remoteVersion or "unknown"))
     end
@@ -218,10 +222,73 @@ local function checkForUpdate()
 end
 
 -- ============================================================
+-- helpers
+-- ============================================================
+
+local function getMissingPlasma(stock, demand)
+    local missing = {}
+    for plasma, info in pairs(demand) do
+        local available = stock[plasma] or 0
+        if available < info.amount then
+            missing[plasma] = info
+        end
+    end
+    return missing
+end
+
+local function clearPatternInputs(interface)
+    local pattern = assert(interface.getInterfacePattern(1), "no pattern in interface")
+
+    local count = 0
+    for slot in pairs(pattern.inputs) do
+        if count ~= 0 then
+            interface.clearInterfacePatternInput(1, slot)
+        end
+        count = count + 1
+    end
+end
+
+local function setPatternInput(interface, slot, source, type, amount)
+    if type == "ITEM" then
+        interface.setInterfacePatternInput(1, slot, {
+            name = source.name,
+            damage = source.damage,
+            size = amount
+        }, "item")
+    else
+        interface.setInterfacePatternInput(1, slot, {
+            name = source.name,
+            size = amount
+        }, "fluid")
+    end
+end
+
+local function tryOrderPattern(interface, label)
+    local recipe = interface.getCraftables({label = label})[1]
+    assert(recipe, "could not find craftable pattern: " .. label)
+
+    local craft = recipe.request(1)
+
+    while craft.isComputing() do
+        os.sleep(0.1)
+    end
+
+    if craft.hasFailed() then
+        return nil
+    end
+
+    return craft
+end
+
+-- ============================================================
 -- cycle steps
 -- ============================================================
 
+-- Step 1: Wait for the exoticizer to output some combination of items and fluids, then return them
 local function waitForOutputs()
+    if VERBOSE then
+        print("Waiting for exoticizer outputs...")
+    end
     while true do
         local items = OutputInterface.getItemsInNetwork()
         local fluids = OutputInterface.getFluidsInNetwork()
@@ -233,7 +300,7 @@ local function waitForOutputs()
         end
 
         if next(items) or next(fluids) then
-            if VERBOSE then
+            if DEBUG then
                 print("Outputs detected:")
                 for _, item in pairs(items) do
                     print("\t" .. item.size .. " " .. item.label)
@@ -251,14 +318,20 @@ local function waitForOutputs()
     end
 end
 
+-- Step 2: Use the outputs from step 1 to calculate the specific plasma types and amounts needed to complete the recipe
 local function calculatePlasmaDemand(items, fluids)
+    if VERBOSE then
+        print("Calculating plasma demand...")
+    end
+
     local demand = {}
     for _, item in pairs(items) do
         local plasma = PLASMAS[item.label]
         assert(plasma, "No plasma mapping for item: " .. item.label)
         demand[plasma] = {
             amount = 9 * 144 * item.size,
-            source = item
+            source = item,
+            type = "ITEM"
         }
     end
 
@@ -267,11 +340,12 @@ local function calculatePlasmaDemand(items, fluids)
         assert(plasma, "No plasma mapping for fluid: " .. fluid.label)
         demand[plasma] = {
             amount = 1000 * fluid.amount,
-            source = fluid
+            source = fluid,
+            type = "FLUID"
         }
     end
 
-    if VERBOSE then
+    if DEBUG then
         print("Plasma demand calculated:")
         for plasma, info in pairs(demand) do
             print(plasma, info.amount, info.source.label)
@@ -281,7 +355,12 @@ local function calculatePlasmaDemand(items, fluids)
     return demand
 end
 
+-- Step 3: Poll the current plasma stocks and build a hashmap for comparison with the demands from step 2
 local function getPlasmaStock()
+    if VERBOSE then
+        print("Polling plasma stock...")
+    end
+
     local stock = {}
 
     for _, fluid in pairs(PlasmaInterface.getFluidsInNetwork()) do
@@ -290,12 +369,57 @@ local function getPlasmaStock()
     return stock
 end
 
-local function ensurePlasmaAvailable(demand)
-    ;
+-- Step 4: Compare stocks to demand and create a pattern requesting the missing plasma types from the fabricator
+local function ensurePlasmaAvailable(stock, demand)
+    if VERBOSE then
+        print("Ensuring plasma availability...")
+    end
+
+    local missing = getMissingPlasma(stock, demand)
+    if next(missing) == nil then
+        return
+    end
+
+    clearPatternInputs(FabricatorInterface)
+
+    local slot = 1
+    for _, info in pairs(missing) do
+        setPatternInput(FabricatorInterface, slot, info.source, info.type, BATCH_SIZE[info.type])
+        slot = slot + 1
+    end
+
+    local craft = tryOrderPattern(FabricatorInterface, "Fabricator")
+    assert(craft, "failed to order plasma pattern!")
+
+    while not craft.isDone() do
+        os.sleep(0.1)
+    end
 end
 
+-- STEP 5: Feed the plasma into the exoticizer to supply the demand from step 2 and complete the cycle
 local function feedPlasma(demand)
-    ;
+    if VERBOSE then
+        print("Feeding plasma to exoticizer...")
+    end
+
+    clearPatternInputs(PlasmaInterface)
+
+    local slot = 1
+    for plasma, info in pairs(demand) do
+        setPatternInput(PlasmaInterface, slot, {name = plasma}, "FLUID", info.amount)
+        slot = slot + 1
+    end
+
+    local craft = tryOrderPattern(PlasmaInterface, "Plasma")
+
+    while not craft do
+        os.sleep(0.1)
+        craft = tryOrderPattern(PlasmaInterface, "Plasma")
+    end
+
+    while not craft.isDone() do
+        os.sleep(0.1)
+    end
 end
 
 -- ============================================================
@@ -305,7 +429,6 @@ end
 OutputInterface = nil
 PlasmaInterface = nil
 FabricatorInterface = nil
-ExoticizerInterface = nil
 
 local function startup()
     if DEBUG then
@@ -324,17 +447,13 @@ local function startup()
 
     FabricatorInterface = findMarkedInterface("Fabricator")
     assert(FabricatorInterface, "could not find gorge fabricator")
-
-    ExoticizerInterface = findMarkedInterface("Exoticizer")
-    assert(ExoticizerInterface, "could not find gorge exoticizer")
 end
 
 local function runOneCycle()
     local items, fluids = waitForOutputs()
     local demand = calculatePlasmaDemand(items, fluids)
-
-    ensurePlasmaAvailable(demand)
-
+    local stock = getPlasmaStock()
+    ensurePlasmaAvailable(stock, demand)
     feedPlasma(demand)
 end
 
