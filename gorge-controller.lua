@@ -1,6 +1,6 @@
 -- Gorge Controller
 -- Author: flouid
--- Automates one QGP Exoticiser cycle at a time.
+-- Automates QGP and Magmatter Exoticiser cycles.
 -- Ctrl+Alt+C to exit.
 
 -- credit where it's due, much of this is stolen Armisael's BEC script: https://github.com/Armisael5/gtnh-bec-controller/tree/main
@@ -8,19 +8,43 @@
 local component = require("component")
 local computer = require("computer")
 local event = require("event")
-local sides = require("sides")
 
 -- ============================================================
 -- config
 -- ============================================================
 
+ENABLE_QGP = true
+ENABLE_MAGMATTER = true
 DEBUG = false
 BATCH_MULTIPLIER = 2^16
 BATCH_SIZE = {
     ITEM = BATCH_MULTIPLIER,
     FLUID = 1000 * BATCH_MULTIPLIER
 }
-PLASMAS = {
+
+IO_INPUT_FIRST_SLOT = 1
+IO_OUTPUT_FIRST_SLOT = 7
+IO_SLOT_COUNT = 6
+QGP_OUTPUT_MARKER_SLOT = 11
+MAGMATTER_OUTPUT_MARKER_SLOT = 12
+OUTPUT_SETTLE_TIME = 0.1
+
+FABRICATOR_SOURCE_OVERRIDES = {
+    ["Infinity Dust"] = {
+        name = "molten.infinity",
+        label = "Molten Infinity",
+        type = "FLUID",
+        batchAmount = 144 * BATCH_MULTIPLIER
+    },
+    ["Dragonblood Dust"] = {
+        name = "molten.dragonblood",
+        label = "Molten Dragonblood",
+        type = "FLUID",
+        batchAmount = 144 * BATCH_MULTIPLIER
+    }
+}
+
+QGP_ATLAS = {
     ["Aluminium Dust"] = "plasma.aluminium",
     ["Americium Dust"] = "plasma.americium",
     ["Antimony Dust"] = "plasma.antimony",
@@ -103,21 +127,117 @@ PLASMAS = {
     ["Zirconium Dust"] = "plasma.zirconium",
 }
 
+MAGMATTER_ATLAS = {
+    ["Awakened Draconium Dust"] = "plasma.draconiumawakened",
+    ["Bedrockium Dust"] = "plasma.bedrockium",
+    ["Celestial Tungsten Dust"] = "plasma.celestialtungsten",
+    ["Chromatic Glass Dust"] = "plasma.chromaticglass",
+    ["Cosmic Neutronium Dust"] = "plasma.cosmicneutronium",
+    ["Draconium Dust"] = "plasma.draconium",
+    ["Dragonblood Dust"] = "plasma.dragonblood",
+    ["Flerovium Dust"] = "plasma.flerovium_gt5u",
+    ["Hypogen Dust"] = "plasma.hypogen",
+    ["Ichorium Dust"] = "plasma.ichorium",
+    ["Infinity Dust"] = "plasma.infinity",
+    ["Neutronium Dust"] = "plasma.neutronium",
+    ["Rhugnor Dust"] = "plasma.rhugnor",
+    ["Six-Phased Copper Dust"] = "plasma.sixphasedcopper",
+    ["Tritanium Dust"] = "plasma.tritanium",
+    ["Spatially Enlarged Fluid"] = "spatialfluid",
+    ["Tachyon Rich Temporal Fluid"] = "temporalfluid",
+}
+
 -- ============================================================
 -- discovery helpers
 -- ============================================================
 
 local function findMarkedInterface(label)
-  for address in component.list("fluid_interface", true) do
-    local proxy = component.proxy(address)
-    local ok, items = pcall(proxy.getItemsInNetwork)
-    if ok and items then
-      for _, item in pairs(items) do
-        if item.label == label then return proxy end
-      end
+    for address in component.list("fluid_interface", true) do
+        local proxy = component.proxy(address)
+        local ok, pattern = pcall(proxy.getInterfacePattern, 1)
+
+        if ok and pattern and pattern.outputs then
+            for _, output in pairs(pattern.outputs) do
+                if output.label == label then
+                    return proxy
+                end
+            end
+        end
     end
-  end
-  return nil
+
+    return nil
+end
+
+local function findTransposerByMarkerSlot(markerSlot)
+    for address in component.list("transposer", true) do
+        local transposer = component.proxy(address)
+        local activeSides = {}
+        local markerSide
+
+        for side = 0, 5 do
+            local ok, size = pcall(transposer.getInventorySize, side)
+
+            if ok and size and size > 0 then
+                table.insert(activeSides, side)
+
+                local stackOk, stack = pcall(transposer.getStackInSlot, side, markerSlot)
+                if stackOk and stack then
+                    markerSide = side
+                end
+            end
+        end
+
+        if markerSide then
+            local otherSide
+
+            for _, side in ipairs(activeSides) do
+                if side ~= markerSide then
+                    otherSide = side
+                end
+            end
+
+            if otherSide then
+                return {
+                    proxy = transposer,
+                    markerSide = markerSide,
+                    otherSide = otherSide,
+                    markerSlot = markerSlot
+                }
+            end
+        end
+    end
+
+    return nil
+end
+
+local function getDriveSlots(shuttle, side)
+    local slots = {}
+
+    for slot = IO_OUTPUT_FIRST_SLOT, IO_OUTPUT_FIRST_SLOT + IO_SLOT_COUNT - 1 do
+        if not (side == shuttle.markerSide and slot == shuttle.markerSlot) then
+            local ok, stack = pcall(shuttle.proxy.getStackInSlot, side, slot)
+
+            if ok and stack then
+                table.insert(slots, slot)
+            end
+        end
+    end
+
+    return slots
+end
+
+local function moveDriveSlots(shuttle, sourceSide, targetSide, slots)
+    for i, sourceSlot in ipairs(slots) do
+        local moved = shuttle.proxy.transferItem(
+            sourceSide,
+            targetSide,
+            1,
+            sourceSlot,
+            IO_INPUT_FIRST_SLOT + i - 1
+        )
+
+        assert(moved and moved > 0, "failed to move output drive")
+    end
 end
 
 -- ============================================================
@@ -147,44 +267,44 @@ end
 -- Networking & Auto updates
 -- ============================================================
 
-local VERSION = "1.1.5"
-local UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/develop/VERSION"
-local UPDATE_SCRIPT_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/develop/gorge-controller.lua"
+local VERSION = "1.3.0"
+local UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/VERSION"
+local UPDATE_SCRIPT_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/gorge-controller.lua"
 
 local function httpRequest(url, postData, headers)
-  local internetAddress
-  for address in component.list("internet", true) do internetAddress = address end
-  if not internetAddress then return nil, "no Internet Card found" end
-  local internet = component.proxy(internetAddress)
+    local internetAddress
+    for address in component.list("internet", true) do internetAddress = address end
+    if not internetAddress then return nil, "no Internet Card found" end
+    local internet = component.proxy(internetAddress)
 
-  local requestOk, handle = pcall(internet.request, url, postData, headers)
-  if not requestOk or not handle then
-    return nil, "request failed: " .. tostring(handle)
-  end
-
-  local chunks = {}
-  local attempts = 0
-  while true do
-    local ok, chunk, _ = pcall(handle.read)
-    if ok then
-      if not chunk then
-        pcall(handle.close)
-        return table.concat(chunks)
-      end
-      table.insert(chunks, chunk)
-    else
-      attempts = attempts + 1
-      if attempts > 50 then
-        pcall(handle.close)
-        return nil, "timed out: " .. tostring(chunk)
-      end
-      os.sleep(0.1)
+    local requestOk, handle = pcall(internet.request, url, postData, headers)
+    if not requestOk or not handle then
+        return nil, "request failed: " .. tostring(handle)
     end
-  end
+
+    local chunks = {}
+    local attempts = 0
+    while true do
+        local ok, chunk, _ = pcall(handle.read)
+        if ok then
+            if not chunk then
+                pcall(handle.close)
+                return table.concat(chunks)
+            end
+            table.insert(chunks, chunk)
+        else
+            attempts = attempts + 1
+            if attempts > 50 then
+                pcall(handle.close)
+                return nil, "timed out: " .. tostring(chunk)
+            end
+            os.sleep(0.1)
+        end
+    end
 end
 
 local function httpGet(url)
-  return httpRequest(url, nil, nil)
+    return httpRequest(url, nil, nil)
 end
 
 local update_applied = false;
@@ -204,6 +324,7 @@ local function checkForUpdate()
     end
 
     local newScript, _ = httpGet(UPDATE_SCRIPT_URL)
+
     local file = io.open(SCRIPT_PATH, "w")
     file:write(newScript)
     file:close()
@@ -214,29 +335,92 @@ local function checkForUpdate()
 end
 
 -- ============================================================
+-- runtime resources
+-- ============================================================
+
+FabricatorInterface = nil
+FabricatorRecipe = nil
+FabricatorPatternSize = 0
+FabricatorOwner = nil
+PlasmaMonitorInterface = nil
+PlasmaSubscribed = false
+GPU = nil
+DisplayWidth = 0
+DisplayHeight = 0
+
+local STATE_WAIT_OUTPUT = 1
+local STATE_WAIT_OUTPUT_EMPTY = 2
+local STATE_WAIT_FABRICATOR = 3
+local STATE_WAIT_PLASMA = 4
+
+local STATE_DISPLAY = {
+    [STATE_WAIT_OUTPUT] = "Waiting for exoticizer outputs",
+    [STATE_WAIT_OUTPUT_EMPTY] = "Flushing outputs to main",
+    [STATE_WAIT_FABRICATOR] = "Waiting for fabricator",
+    [STATE_WAIT_PLASMA] = "Waiting for plasma"
+}
+
+local QGP = {
+    enabled = ENABLE_QGP,
+    name = "QGP",
+    atlas = QGP_ATLAS,
+    outputMarker = "QGP Output",
+    inputMarker = "QGP Input",
+    productLabel = "Degenerate Quark Gluon Plasma",
+    expectedOutputs = 7,
+    outputMarkerSlot = QGP_OUTPUT_MARKER_SLOT,
+    outputDriveCount = 3,
+    displayRow = 1
+}
+
+local Magmatter = {
+    enabled = ENABLE_MAGMATTER,
+    name = "Magmatter",
+    atlas = MAGMATTER_ATLAS,
+    outputMarker = "Magmatter Output",
+    inputMarker = "Magmatter Input",
+    productLabel = "Molten Magmatter",
+    expectedOutputs = 3,
+    outputMarkerSlot = MAGMATTER_OUTPUT_MARKER_SLOT,
+    outputDriveCount = 2,
+    displayRow = 2
+}
+
+local Modules = {QGP, Magmatter}
+
+-- ============================================================
 -- helpers
 -- ============================================================
 
-local function checkOutputEmpty()
-    local fluids = OutputInterface.getFluidsInNetwork()
+local function checkOutputEmpty(module)
+    local fluids = module.outputInterface.getFluidsInNetwork()
+
     if next(fluids) then return false end
 
-    local items = OutputInterface.getItemsInNetwork()
+    local items = module.outputInterface.getItemsInNetwork()
+
     for _, item in pairs(items) do
-        if item.label ~= "Output" then return false end
+        if item.label ~= module.outputMarker then return false end
     end
 
     return true
 end
 
-local function getMissingPlasma(demand)
+local function getPlasmaStock()
     local stock = {}
 
-    for _, fluid in pairs(PlasmaInterface.getFluidsInNetwork()) do
+    for _, fluid in pairs(PlasmaMonitorInterface.getFluidsInNetwork()) do
         stock[fluid.name] = fluid.amount
     end
 
+    return stock
+end
+
+local function getMissingPlasma(demand, stock)
+    stock = stock or getPlasmaStock()
+
     local missing = {}
+
     for plasma, info in pairs(demand) do
         if (stock[plasma] or 0) < info.amount then
             missing[plasma] = info
@@ -244,6 +428,22 @@ local function getMissingPlasma(demand)
     end
 
     return missing
+end
+
+local function getFabricatorSource(source, type)
+    local override = FABRICATOR_SOURCE_OVERRIDES[source.label]
+
+    if override then
+        return override
+    end
+
+    return {
+        name = source.name,
+        damage = source.damage,
+        label = source.label,
+        type = type,
+        batchAmount = BATCH_SIZE[type]
+    }
 end
 
 local function getPatternSize(interface)
@@ -282,15 +482,15 @@ local function orderPattern(recipe)
     return recipe.request(1)
 end
 
-local function printMaterialShortages(missing)
-    print("Craft failed. Current material shortages:")
+local function printMaterialShortages(module)
+    print(module.name .. " craft failed. Current material shortages:")
 
-    for _, info in pairs(missing) do
+    for _, info in pairs(module.missingPlasma) do
         local source = info.source
-        local needed = BATCH_SIZE[info.type]
+        local needed = source.batchAmount
         local stored
 
-        if info.type == "ITEM" then
+        if source.type == "ITEM" then
             stored = FabricatorInterface.getItemInNetwork(
                 source.name,
                 source.damage
@@ -308,17 +508,12 @@ local function printMaterialShortages(missing)
     end
 end
 
--- ============================================================
--- cycle steps
--- ============================================================
-
--- Step 1: Check for the exoticizer to output some combination of items and fluids, then return them
-local function checkForOutputs()
-    local items = OutputInterface.getItemsInNetwork()
+local function checkForOutputs(module)
+    local items = module.outputInterface.getItemsInNetwork()
     local count = 0
 
     for i, item in pairs(items) do
-        if item.label == "Output" then
+        if item.label == module.outputMarker then
             items[i] = nil
         else
             count = count + 1
@@ -326,11 +521,12 @@ local function checkForOutputs()
     end
 
     local fluids = {}
-    if count < 7 then
-        fluids = OutputInterface.getFluidsInNetwork()
+
+    if count < module.expectedOutputs then
+        fluids = module.outputInterface.getFluidsInNetwork()
 
         for i, fluid in pairs(fluids) do
-            if fluid.label == "Degenerate Quark Gluon Plasma" then
+            if fluid.label == module.productLabel then
                 fluids[i] = nil
             else
                 count = count + 1
@@ -338,9 +534,10 @@ local function checkForOutputs()
         end
     end
 
-    if count == 7 then
+    if count == module.expectedOutputs then
         if DEBUG then
-            print("Outputs detected:")
+            print(module.name .. " outputs detected:")
+
             for _, item in pairs(items) do
                 print("\t" .. item.size .. " " .. item.label)
             end
@@ -354,146 +551,205 @@ local function checkForOutputs()
     end
 end
 
--- Step 2: Flush the outputs to main, we do not need them anymore (and prep for next cycle)
-local function flushOutputs()
-    RedstoneIO.setOutput({
-        [sides.bottom] = 15,
-        [sides.top] = 15,
-        [sides.north] = 15,
-        [sides.south] = 15,
-        [sides.west] = 15,
-        [sides.east] = 15
-    })
+local function flushOutputs(module)
+    local drives = getDriveSlots(module.outputShuttle, module.outputShuttle.otherSide)
+
+    assert(
+        #drives == module.outputDriveCount,
+        "expected " .. module.outputDriveCount .. " " .. module.name
+            .. " output drives, found " .. #drives
+    )
+
+    moveDriveSlots(
+        module.outputShuttle,
+        module.outputShuttle.otherSide,
+        module.outputShuttle.markerSide,
+        drives
+    )
 end
 
-local function finishFlushOutputs()
-    RedstoneIO.setOutput({
-        [sides.bottom] = 0,
-        [sides.top] = 0,
-        [sides.north] = 0,
-        [sides.south] = 0,
-        [sides.west] = 0,
-        [sides.east] = 0
-    })
+local function finishFlushOutputs(module)
+    os.sleep(OUTPUT_SETTLE_TIME)
+
+    local drives = getDriveSlots(module.outputShuttle, module.outputShuttle.markerSide)
+
+    assert(
+        #drives == module.outputDriveCount,
+        "expected " .. module.outputDriveCount .. " " .. module.name
+            .. " output drives to return, found " .. #drives
+    )
+
+    moveDriveSlots(
+        module.outputShuttle,
+        module.outputShuttle.markerSide,
+        module.outputShuttle.otherSide,
+        drives
+    )
 end
 
--- Step 3: Use the outputs from step 1 to calculate the specific plasma types and amounts needed to complete the recipe
-local function calculatePlasmaDemand(items, fluids)
+local function calculateQGPDemand(items, fluids)
     local demand = {}
+
     for _, item in pairs(items) do
-        local plasma = PLASMAS[item.label]
-        assert(plasma, "No plasma mapping for item: " .. item.label)
+        local plasma = QGP_ATLAS[item.label]
+        assert(plasma, "No QGP plasma mapping for item: " .. item.label)
+
         demand[plasma] = {
             amount = 9 * 144 * item.size,
-            source = item,
-            type = "ITEM"
+            source = getFabricatorSource(item, "ITEM")
         }
     end
 
     for _, fluid in pairs(fluids) do
-        local plasma = PLASMAS[fluid.label]
-        assert(plasma, "No plasma mapping for fluid: " .. fluid.label)
+        local plasma = QGP_ATLAS[fluid.label]
+        assert(plasma, "No QGP plasma mapping for fluid: " .. fluid.label)
+
         demand[plasma] = {
             amount = 1000 * fluid.amount,
-            source = fluid,
-            type = "FLUID"
+            source = getFabricatorSource(fluid, "FLUID")
         }
-    end
-
-    if DEBUG then
-        print("Plasma demand calculated:")
-        for plasma, info in pairs(demand) do
-            print(plasma, info.amount, info.source.label)
-        end
     end
 
     return demand
 end
 
--- Step 4: Compare stocks to demand and create a pattern requesting the missing plasma types from the fabricator
-local function orderPlasmaFabrication(missing)
+local function calculateMagmatterDemand(items, fluids)
+    local demand = {}
+    local spatial
+    local temporal
+
+    for _, fluid in pairs(fluids) do
+        if fluid.label == "Spatially Enlarged Fluid" then
+            spatial = fluid.amount
+        elseif fluid.label == "Tachyon Rich Temporal Fluid" then
+            temporal = fluid.amount
+        end
+    end
+
+    assert(spatial, "Magmatter challenge missing Spatially Enlarged Fluid")
+    assert(temporal, "Magmatter challenge missing Tachyon Rich Temporal Fluid")
+
+    local plasmaAmount = math.abs(spatial - temporal) * 144
+
+    for _, item in pairs(items) do
+        local plasma = MAGMATTER_ATLAS[item.label]
+        assert(plasma, "No Magmatter plasma mapping for item: " .. item.label)
+
+        demand[plasma] = {
+            amount = plasmaAmount,
+            source = getFabricatorSource(item, "ITEM")
+        }
+    end
+
+    for _, fluid in pairs(fluids) do
+        local plasma = MAGMATTER_ATLAS[fluid.label]
+        assert(plasma, "No Magmatter plasma mapping for fluid: " .. fluid.label)
+
+        demand[plasma] = {
+            amount = fluid.amount,
+            source = getFabricatorSource(fluid, "FLUID")
+        }
+    end
+
+    return demand
+end
+
+local function calculatePlasmaDemand(module, items, fluids)
+    if module == QGP then
+        return calculateQGPDemand(items, fluids)
+    end
+
+    return calculateMagmatterDemand(items, fluids)
+end
+
+local function writeFabricatorPattern(missing)
     local slot = 1
+
     for _, info in pairs(missing) do
-        setPatternInput(FabricatorInterface, slot, info.source, info.type, BATCH_SIZE[info.type])
+        local source = info.source
+        setPatternInput(FabricatorInterface, slot, source, source.type, source.batchAmount)
         slot = slot + 1
     end
 
     clearUnusedPatternInputs(FabricatorInterface, slot, FabricatorPatternSize)
     FabricatorPatternSize = slot - 1
-
-    return orderPattern(FabricatorRecipe)
 end
 
-local function ensurePlasmaAvailable(demand)
-    local missing = getMissingPlasma(demand)
-    if next(missing) == nil then return true end
-
-    return false, missing, orderPlasmaFabrication(missing)
-end
-
--- Step 5: Feed the plasma into the exoticizer to supply the demand from step 3 and complete the cycle
-local function feedPlasma(demand)
+local function feedPlasma(module)
     local slot = 1
-    for plasma, info in pairs(demand) do
-        setPatternInput(PlasmaInterface, slot, {name = plasma}, "FLUID", info.amount)
+
+    for plasma, info in pairs(module.demand) do
+        setPatternInput(module.inputInterface, slot, {name = plasma}, "FLUID", info.amount)
         slot = slot + 1
     end
 
-    clearUnusedPatternInputs(PlasmaInterface, slot, PlasmaPatternSize)
-    PlasmaPatternSize = slot - 1
+    clearUnusedPatternInputs(module.inputInterface, slot, module.inputPatternSize)
+    module.inputPatternSize = slot - 1
 
-    return orderPattern(PlasmaRecipe)
+    return orderPattern(module.inputRecipe)
 end
 
 -- ============================================================
--- event state machine
+-- display
 -- ============================================================
 
-local STATE_WAIT_OUTPUT = 1
-local STATE_WAIT_OUTPUT_EMPTY = 2
-local STATE_WAIT_PLASMA = 3
-
-local STATE_DISPLAY = {
-    [STATE_WAIT_OUTPUT] = "Waiting for exoticizer outputs",
-    [STATE_WAIT_OUTPUT_EMPTY] = "Flushing outputs to main",
-    [STATE_WAIT_PLASMA] = "Waiting for plasma"
-}
-
-local state = nil
-local cycleItems = nil
-local cycleFluids = nil
-local demand = nil
-local missingPlasma = nil
-local fabricatorCraft = nil
-local fabricatorRetryAt = nil
-local exoticizerCraft = nil
-
-local function render()
-    local text = "QGP: " .. STATE_DISPLAY[state]
+local function renderModule(module)
+    local status = module.enabled and STATE_DISPLAY[module.state] or "Disabled"
+    local text = module.name .. ": " .. status
     text = text:sub(1, DisplayWidth)
 
-    GPU.set(1, 1, text .. string.rep(" ", DisplayWidth - #text))
+    GPU.set(1, module.displayRow, text .. string.rep(" ", DisplayWidth - #text))
 end
 
-local function setState(newState)
-    if state == newState then return end
+local updateSubscriptions
 
-    state = newState
-    render()
+local function setState(module, newState)
+    if module.state == newState then return end
+
+    module.state = newState
+    renderModule(module)
+
+    if updateSubscriptions then
+        updateSubscriptions()
+    end
 end
 
-local function subscribeOutput()
-    PlasmaInterface.setFluidEventSubscription(false)
+-- ============================================================
+-- event subscriptions
+-- ============================================================
 
-    OutputInterface.setItemEventSubscription(true)
-    OutputInterface.setFluidEventSubscription(true)
+local function setOutputSubscription(module, enabled)
+    if not module.enabled or module.outputSubscribed == enabled then return end
+
+    module.outputInterface.setItemEventSubscription(enabled)
+    module.outputInterface.setFluidEventSubscription(enabled)
+    module.outputSubscribed = enabled
 end
 
-local function subscribePlasma()
-    OutputInterface.setItemEventSubscription(false)
-    OutputInterface.setFluidEventSubscription(false)
+updateSubscriptions = function()
+    for _, module in ipairs(Modules) do
+        if module.enabled then
+            local wantsOutput =
+                module.state == STATE_WAIT_OUTPUT
+                or module.state == STATE_WAIT_OUTPUT_EMPTY
 
-    PlasmaInterface.setFluidEventSubscription(true)
+            setOutputSubscription(module, wantsOutput)
+        end
+    end
+
+    local wantsPlasma = false
+
+    for _, module in ipairs(Modules) do
+        if module.enabled and module.state == STATE_WAIT_PLASMA then
+            wantsPlasma = true
+            break
+        end
+    end
+
+    if PlasmaMonitorInterface and PlasmaSubscribed ~= wantsPlasma then
+        PlasmaMonitorInterface.setFluidEventSubscription(wantsPlasma)
+        PlasmaSubscribed = wantsPlasma
+    end
 end
 
 local function pullDebounced(timeout)
@@ -522,134 +778,303 @@ local function pullDebounced(timeout)
     return eventName
 end
 
-local function beginCycle()
-    setState(STATE_WAIT_OUTPUT)
-    cycleItems = nil
-    cycleFluids = nil
-    demand = nil
-    missingPlasma = nil
-    fabricatorCraft = nil
-    fabricatorRetryAt = nil
-end
+-- ============================================================
+-- fabricator coordination
+-- ============================================================
 
-local function finishPlasmaWait()
-    fabricatorCraft = nil
-    fabricatorRetryAt = nil
-    missingPlasma = nil
+local serviceFabricatorQueue
+local finishPlasmaWait
 
-    subscribeOutput()
-
-    local craft = feedPlasma(demand)
-    if DEBUG then exoticizerCraft = craft end
-
-    beginCycle()
-end
-
-local function checkExoticizerCraft()
-    if not DEBUG or not exoticizerCraft or exoticizerCraft.isComputing() then return end
-
-    if exoticizerCraft.hasFailed() then
-        print("WARNING: AE2 reported craft failure, waiting for exoticizer...")
+local function tryStartFabrication(module)
+    if not module.enabled
+        or module.state ~= STATE_WAIT_FABRICATOR
+        or FabricatorOwner
+        or module.fabricatorRetryAt then
+        return
     end
 
-    exoticizerCraft = nil
+    FabricatorOwner = module
+    writeFabricatorPattern(module.missingPlasma)
+    module.fabricatorCraft = orderPattern(FabricatorRecipe)
+    module.fabricatorRetryAt = computer.uptime() + 1
 end
 
-local function advanceQGP(eventName)
-    checkExoticizerCraft()
+serviceFabricatorQueue = function()
+    if FabricatorOwner then return end
 
-    if state == STATE_WAIT_OUTPUT then
-        if eventName and eventName ~= "network_item_changed" and eventName ~= "network_fluid_changed" then return end
+    for _, module in ipairs(Modules) do
+        if module.enabled
+            and module.state == STATE_WAIT_FABRICATOR
+            and not module.fabricatorRetryAt then
+            tryStartFabrication(module)
+            return
+        end
+    end
+end
 
-        local items, fluids = checkForOutputs()
+local function handleFabricatorTimer(module)
+    if not module.enabled
+        or module.state ~= STATE_WAIT_FABRICATOR
+        or not module.fabricatorRetryAt
+        or computer.uptime() < module.fabricatorRetryAt then
+        return
+    end
+
+    if FabricatorOwner == module and module.fabricatorCraft then
+        if module.fabricatorCraft.isComputing() then
+            module.fabricatorRetryAt = computer.uptime() + 1
+            return
+        end
+
+        if module.fabricatorCraft.hasFailed() then
+            printMaterialShortages(module)
+            module.fabricatorCraft = nil
+            module.fabricatorRetryAt = computer.uptime() + 60
+            FabricatorOwner = nil
+            serviceFabricatorQueue()
+            return
+        end
+
+        module.fabricatorCraft = nil
+        module.fabricatorRetryAt = nil
+        FabricatorOwner = nil
+
+        setState(module, STATE_WAIT_PLASMA)
+
+        local stock = getPlasmaStock()
+        module.missingPlasma = getMissingPlasma(module.demand, stock)
+
+        if next(module.missingPlasma) == nil then
+            finishPlasmaWait(module)
+        end
+
+        serviceFabricatorQueue()
+        return
+    end
+
+    if FabricatorOwner and FabricatorOwner ~= module then
+        module.fabricatorRetryAt = nil
+        return
+    end
+
+    module.fabricatorRetryAt = nil
+    tryStartFabrication(module)
+end
+
+-- ============================================================
+-- module state machines
+-- ============================================================
+
+local function beginCycle(module)
+    module.cycleItems = nil
+    module.cycleFluids = nil
+    module.demand = nil
+    module.missingPlasma = nil
+    module.fabricatorCraft = nil
+    module.fabricatorRetryAt = nil
+    module.exoticizerCraft = nil
+
+    setState(module, STATE_WAIT_OUTPUT)
+end
+
+finishPlasmaWait = function(module)
+    module.fabricatorCraft = nil
+    module.fabricatorRetryAt = nil
+    module.missingPlasma = nil
+
+    -- Subscribe to this module's output before ordering the input pattern so
+    -- an extremely fast Exoticizer cycle cannot finish before we are listening.
+    setState(module, STATE_WAIT_OUTPUT)
+
+    local craft = feedPlasma(module)
+    if DEBUG then module.exoticizerCraft = craft end
+
+    module.cycleItems = nil
+    module.cycleFluids = nil
+    module.demand = nil
+end
+
+local function checkExoticizerCraft(module)
+    if not DEBUG or not module.exoticizerCraft or module.exoticizerCraft.isComputing() then return end
+
+    if module.exoticizerCraft.hasFailed() then
+        print("WARNING: AE2 reported " .. module.name .. " craft failure, waiting for exoticizer...")
+    end
+
+    module.exoticizerCraft = nil
+end
+
+local function advanceModule(module, eventName, plasmaStock)
+    if not module.enabled then return end
+
+    checkExoticizerCraft(module)
+
+    if module.state == STATE_WAIT_OUTPUT then
+        if eventName
+            and eventName ~= "network_item_changed"
+            and eventName ~= "network_fluid_changed" then
+            return
+        end
+
+        local items, fluids = checkForOutputs(module)
         if not items then return end
 
-        cycleItems = items
-        cycleFluids = fluids
-        setState(STATE_WAIT_OUTPUT_EMPTY)
-        flushOutputs()
+        module.cycleItems = items
+        module.cycleFluids = fluids
+
+        setState(module, STATE_WAIT_OUTPUT_EMPTY)
+        flushOutputs(module)
         return
     end
 
-    if state == STATE_WAIT_OUTPUT_EMPTY then
-        if eventName ~= "network_item_changed" and eventName ~= "network_fluid_changed" then return end
-        if not checkOutputEmpty() then return end
-
-        finishFlushOutputs()
-        demand = calculatePlasmaDemand(cycleItems, cycleFluids)
-        cycleItems = nil
-        cycleFluids = nil
-
-        local ready, missing, craft = ensurePlasmaAvailable(demand)
-        if ready then
-            finishPlasmaWait()
+    if module.state == STATE_WAIT_OUTPUT_EMPTY then
+        if eventName ~= "network_item_changed"
+            and eventName ~= "network_fluid_changed" then
             return
         end
 
-        missingPlasma = missing
-        fabricatorCraft = craft
-        fabricatorRetryAt = computer.uptime() + 1
-        setState(STATE_WAIT_PLASMA)
+        if not checkOutputEmpty(module) then return end
 
-        subscribePlasma()
+        finishFlushOutputs(module)
 
-        missingPlasma = getMissingPlasma(demand)
-        if next(missingPlasma) == nil then
-            finishPlasmaWait()
+        module.demand = calculatePlasmaDemand(
+            module,
+            module.cycleItems,
+            module.cycleFluids
+        )
+
+        module.cycleItems = nil
+        module.cycleFluids = nil
+        module.missingPlasma = getMissingPlasma(module.demand, plasmaStock)
+
+        if next(module.missingPlasma) == nil then
+            finishPlasmaWait(module)
+            return
         end
 
+        setState(module, STATE_WAIT_FABRICATOR)
+        serviceFabricatorQueue()
         return
     end
 
-    if state == STATE_WAIT_PLASMA then
+    if module.state == STATE_WAIT_PLASMA then
         if eventName ~= "network_fluid_changed" then return end
 
-        missingPlasma = getMissingPlasma(demand)
-        if next(missingPlasma) == nil then
-            finishPlasmaWait()
+        module.missingPlasma = getMissingPlasma(module.demand, plasmaStock)
+
+        if next(module.missingPlasma) == nil then
+            finishPlasmaWait(module)
         end
     end
 end
 
-local function handleFabricatorTimer()
-    if state ~= STATE_WAIT_PLASMA or not fabricatorRetryAt then return end
+local function advanceQGP(eventName, plasmaStock)
+    advanceModule(QGP, eventName, plasmaStock)
+end
 
-    if fabricatorCraft then
-        if fabricatorCraft.isComputing() then
-            fabricatorRetryAt = computer.uptime() + 1
-            return
+local function advanceMagmatter(eventName, plasmaStock)
+    advanceModule(Magmatter, eventName, plasmaStock)
+end
+
+local function dispatchEvent(eventName)
+    local plasmaStock
+
+    if eventName == "network_fluid_changed" then
+        for _, module in ipairs(Modules) do
+            if module.enabled and module.state == STATE_WAIT_PLASMA then
+                plasmaStock = getPlasmaStock()
+                break
+            end
         end
-
-        if fabricatorCraft.hasFailed() then
-            printMaterialShortages(missingPlasma)
-            fabricatorCraft = nil
-            fabricatorRetryAt = computer.uptime() + 60
-        else
-            fabricatorRetryAt = nil
-        end
-
-        return
     end
 
-    fabricatorCraft = orderPattern(FabricatorRecipe)
-    fabricatorRetryAt = computer.uptime() + 1
+    if ENABLE_QGP then
+        advanceQGP(eventName, plasmaStock)
+    end
+
+    if ENABLE_MAGMATTER then
+        advanceMagmatter(eventName, plasmaStock)
+    end
+
+    serviceFabricatorQueue()
+end
+
+local function getNextTimer()
+    local nextTimer
+
+    for _, module in ipairs(Modules) do
+        if module.enabled and module.fabricatorRetryAt then
+            if not nextTimer or module.fabricatorRetryAt < nextTimer then
+                nextTimer = module.fabricatorRetryAt
+            end
+        end
+    end
+
+    return nextTimer
+end
+
+local function handleTimers()
+    local now = computer.uptime()
+
+    for _, module in ipairs(Modules) do
+        if module.enabled
+            and module.fabricatorRetryAt
+            and now >= module.fabricatorRetryAt then
+            handleFabricatorTimer(module)
+        end
+    end
+
+    serviceFabricatorQueue()
 end
 
 -- ============================================================
 -- runtime
 -- ============================================================
 
-OutputInterface = nil
-PlasmaInterface = nil
-FabricatorInterface = nil
-RedstoneIO = nil
-FabricatorRecipe = nil
-PlasmaRecipe = nil
-FabricatorPatternSize = 0
-PlasmaPatternSize = 0
-GPU = nil
-DisplayWidth = 0
-DisplayHeight = 0
+local function discoverModule(module)
+    module.outputInterface = findMarkedInterface(module.outputMarker)
+    assert(module.outputInterface, "could not find " .. module.name .. " output subnet")
+
+    module.inputInterface = findMarkedInterface(module.inputMarker)
+    assert(module.inputInterface, "could not find " .. module.name .. " input interface")
+
+    module.outputShuttle = findTransposerByMarkerSlot(module.outputMarkerSlot)
+    assert(module.outputShuttle, "could not find " .. module.name .. " output transposer")
+
+    local markerDrives = getDriveSlots(
+        module.outputShuttle,
+        module.outputShuttle.markerSide
+    )
+
+    if #markerDrives > 0 then
+        moveDriveSlots(
+            module.outputShuttle,
+            module.outputShuttle.markerSide,
+            module.outputShuttle.otherSide,
+            markerDrives
+        )
+
+        os.sleep(OUTPUT_SETTLE_TIME)
+    end
+
+    local restingDrives = getDriveSlots(
+        module.outputShuttle,
+        module.outputShuttle.otherSide
+    )
+
+    assert(
+        #restingDrives == module.outputDriveCount,
+        "expected " .. module.outputDriveCount .. " " .. module.name
+            .. " output drives at startup, found " .. #restingDrives
+    )
+
+    module.inputPatternSize = getPatternSize(module.inputInterface)
+
+    module.inputRecipe = module.inputInterface.getCraftables({label = module.inputMarker})[1]
+    assert(module.inputRecipe, "could not find " .. module.name .. " input pattern")
+
+    module.outputSubscribed = false
+end
 
 local function startup()
     if DEBUG then
@@ -660,35 +1085,37 @@ local function startup()
 
     print("Discovering components...")
 
-    OutputInterface = findMarkedInterface("Output")
-    assert(OutputInterface, "could not find gorge output subnet")
+    if ENABLE_QGP then
+        discoverModule(QGP)
+    end
 
-    PlasmaInterface = findMarkedInterface("Plasma")
-    assert(PlasmaInterface, "could not find gorge plasma subnet")
+    if ENABLE_MAGMATTER then
+        discoverModule(Magmatter)
+    end
 
-    FabricatorInterface = findMarkedInterface("Fabricator")
-    assert(FabricatorInterface, "could not find gorge fabricator")
+    if ENABLE_QGP or ENABLE_MAGMATTER then
+        FabricatorInterface = findMarkedInterface("Fabricator")
+        assert(FabricatorInterface, "could not find gorge fabricator")
 
-    FabricatorPatternSize = getPatternSize(FabricatorInterface)
-    PlasmaPatternSize = getPatternSize(PlasmaInterface)
+        FabricatorPatternSize = getPatternSize(FabricatorInterface)
 
-    FabricatorRecipe = FabricatorInterface.getCraftables({label = "Fabricator"})[1]
-    assert(FabricatorRecipe, "could not find fabricator pattern")
+        FabricatorRecipe = FabricatorInterface.getCraftables({label = "Fabricator"})[1]
+        assert(FabricatorRecipe, "could not find fabricator pattern")
 
-    PlasmaRecipe = PlasmaInterface.getCraftables({label = "Plasma"})[1]
-    assert(PlasmaRecipe, "could not find plasma pattern")
+        PlasmaMonitorInterface =
+            (ENABLE_QGP and QGP.inputInterface)
+            or (ENABLE_MAGMATTER and Magmatter.inputInterface)
+    end
 
-    local address = component.list("redstone", true)()
-    assert(address, "could not find redstone IO")
-    RedstoneIO = component.proxy(address)
-
-    address = component.list("gpu", true)()
+    local address = component.list("gpu", true)()
     assert(address, "could not find GPU")
+
     GPU = component.proxy(address)
     DisplayWidth, DisplayHeight = GPU.getResolution()
     GPU.fill(1, 1, DisplayWidth, DisplayHeight, " ")
 
-    subscribeOutput()
+    renderModule(QGP)
+    renderModule(Magmatter)
 end
 
 -- ============================================================
@@ -703,22 +1130,39 @@ if update_applied then
 end
 
 startup()
-beginCycle()
-advanceQGP()
+
+if ENABLE_QGP then
+    beginCycle(QGP)
+end
+
+if ENABLE_MAGMATTER then
+    beginCycle(Magmatter)
+end
+
+if ENABLE_QGP then
+    advanceQGP()
+end
+
+if ENABLE_MAGMATTER then
+    advanceMagmatter()
+end
+
+updateSubscriptions()
 
 while true do
-    if fabricatorRetryAt and computer.uptime() >= fabricatorRetryAt then
-        handleFabricatorTimer()
-    else
-        local timeout = nil
-        if fabricatorRetryAt then
-            timeout = fabricatorRetryAt - computer.uptime()
-        end
+    handleTimers()
 
-        local eventName = pullDebounced(timeout)
+    local nextTimer = getNextTimer()
+    local timeout
 
-        if eventName == "network_item_changed" or eventName == "network_fluid_changed" then
-            advanceQGP(eventName)
-        end
+    if nextTimer then
+        timeout = math.max(0, nextTimer - computer.uptime())
+    end
+
+    local eventName = pullDebounced(timeout)
+
+    if eventName == "network_item_changed"
+        or eventName == "network_fluid_changed" then
+        dispatchEvent(eventName)
     end
 end
