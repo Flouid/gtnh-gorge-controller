@@ -14,7 +14,7 @@ local event = require("event")
 -- ============================================================
 
 ENABLE_QGP = true
-ENABLE_MAGMATTER = false
+ENABLE_MAGMATTER = true
 DEBUG = false
 BATCH_MULTIPLIER = 2^16
 BATCH_SIZE = {
@@ -28,6 +28,21 @@ IO_SLOT_COUNT = 6
 QGP_OUTPUT_MARKER_SLOT = 11
 MAGMATTER_OUTPUT_MARKER_SLOT = 12
 OUTPUT_SETTLE_TIME = 0.1
+
+FABRICATOR_SOURCE_OVERRIDES = {
+    ["Infinity Dust"] = {
+        name = "molten.infinity",
+        label = "Molten Infinity",
+        type = "FLUID",
+        batchAmount = 144 * BATCH_MULTIPLIER
+    },
+    ["Dragonblood Dust"] = {
+        name = "molten.dragonblood",
+        label = "Molten Dragonblood",
+        type = "FLUID",
+        batchAmount = 144 * BATCH_MULTIPLIER
+    }
+}
 
 QGP_ATLAS = {
     ["Aluminium Dust"] = "plasma.aluminium",
@@ -252,9 +267,9 @@ end
 -- Networking & Auto updates
 -- ============================================================
 
-local VERSION = "1.2.1"
-local UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/develop/VERSION"
-local UPDATE_SCRIPT_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/develop/gorge-controller.lua"
+local VERSION = "1.3.0"
+local UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/VERSION"
+local UPDATE_SCRIPT_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/gorge-controller.lua"
 
 local function httpRequest(url, postData, headers)
     local internetAddress
@@ -415,6 +430,22 @@ local function getMissingPlasma(demand, stock)
     return missing
 end
 
+local function getFabricatorSource(source, type)
+    local override = FABRICATOR_SOURCE_OVERRIDES[source.label]
+
+    if override then
+        return override
+    end
+
+    return {
+        name = source.name,
+        damage = source.damage,
+        label = source.label,
+        type = type,
+        batchAmount = BATCH_SIZE[type]
+    }
+end
+
 local function getPatternSize(interface)
     local pattern = assert(interface.getInterfacePattern(1), "no pattern in interface")
     local size = 0
@@ -456,10 +487,10 @@ local function printMaterialShortages(module)
 
     for _, info in pairs(module.missingPlasma) do
         local source = info.source
-        local needed = BATCH_SIZE[info.type]
+        local needed = source.batchAmount
         local stored
 
-        if info.type == "ITEM" then
+        if source.type == "ITEM" then
             stored = FabricatorInterface.getItemInNetwork(
                 source.name,
                 source.damage
@@ -565,8 +596,7 @@ local function calculateQGPDemand(items, fluids)
 
         demand[plasma] = {
             amount = 9 * 144 * item.size,
-            source = item,
-            type = "ITEM"
+            source = getFabricatorSource(item, "ITEM")
         }
     end
 
@@ -576,8 +606,7 @@ local function calculateQGPDemand(items, fluids)
 
         demand[plasma] = {
             amount = 1000 * fluid.amount,
-            source = fluid,
-            type = "FLUID"
+            source = getFabricatorSource(fluid, "FLUID")
         }
     end
 
@@ -608,8 +637,7 @@ local function calculateMagmatterDemand(items, fluids)
 
         demand[plasma] = {
             amount = plasmaAmount,
-            source = item,
-            type = "ITEM"
+            source = getFabricatorSource(item, "ITEM")
         }
     end
 
@@ -619,8 +647,7 @@ local function calculateMagmatterDemand(items, fluids)
 
         demand[plasma] = {
             amount = fluid.amount,
-            source = fluid,
-            type = "FLUID"
+            source = getFabricatorSource(fluid, "FLUID")
         }
     end
 
@@ -639,7 +666,8 @@ local function writeFabricatorPattern(missing)
     local slot = 1
 
     for _, info in pairs(missing) do
-        setPatternInput(FabricatorInterface, slot, info.source, info.type, BATCH_SIZE[info.type])
+        local source = info.source
+        setPatternInput(FabricatorInterface, slot, source, source.type, source.batchAmount)
         slot = slot + 1
     end
 
