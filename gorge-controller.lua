@@ -292,9 +292,9 @@ end
 -- Networking & Auto updates
 -- ============================================================
 
-local VERSION = "1.3.2"
-local UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/develop/VERSION"
-local UPDATE_SCRIPT_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/develop/gorge-controller.lua"
+local VERSION = "1.3.3"
+local UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/VERSION"
+local UPDATE_SCRIPT_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/gorge-controller.lua"
 
 local function httpRequest(url, postData, headers)
     local internetAddress

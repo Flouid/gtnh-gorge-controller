@@ -2,14 +2,14 @@
 The concept behind this automation is that any given craft uses a relatively small amount of plasma, ordering patterns is slow and relatively expensive for performance, and it's inefficient to use a plasma fabricator to do only a few kL of plasma at a time. So, we endeavor to instead keep a healthy stock of all available plasmas on hand and feed them into the module (QGP and/or Magmatter) the moment we know what the demand is. When we get low, we order a new batch from the dedicated plasma fabricator.
 
 ## Setup
-This script is modular and configurable. It will run both QGP and Magmatter concurrently by default, as well as autoupdate and autorestart. You can disable either module and/or auto-update by editing the flags at the top of the file. If you change the defaults, you may want to turn auto-update off as it will wipe them out when it next restarts.
+This script is modular and configurable. It will run both QGP and Magmatter concurrently by default, as well as autoupdate and autorestart. You can disable either module and/or auto-update by editing the flags at the top of the file. If you change the defaults, you may want to turn auto-update off as it will wipe them out when it next restarts if an update is available.
 
-You will need an OC computer, 1-2 Heliofusion Exoticiser modules, a dedicated Plasma Fabricator, and a small collection of subnets to make this work. We'll go through all of the subnets one by one during setup.
+You will need an OC computer, 1-2 Heliofusion Exoticiser modules, a dedicated Plasma Fabricator, and a small collection of subnets to make this work. We'll go through all of the subnets one by one during setup. If you are only using one module, you only need to build that module's subnets. 
 
 ![alt text](images/overview.png)
 
 ### Subnet 1 - QGP Output
-The purpose of this setup is to capture the outputs (the "challenge") from the QGP module and give OC an opportunity to cache them. It also collects the QGP produced by the previous cycle. During normal operation, this subnet flushes it's contents to main once per recipe cycle.
+The purpose of this subnet is to capture the outputs (the "challenge") from the QGP module and give OC an opportunity to cache them. It also collects the QGP produced by the previous cycle. During normal operation, this subnet flushes it's contents to main once per recipe cycle.
 
 Inside the ME drive, place at least one item storage cell and two fluid storage cells. This is because there may be up to 8 fluid types or 7 item types present in this subnet. I used 16384k cells. 
 
@@ -27,7 +27,7 @@ Inside the IO port on the left, copy the following setup exactly. Leave the conf
 Finally, connect the dual interface to an OC network using an adapter, place a transposer between the two IO ports, and connect the second IO port containing the cells directly to main (colored orange) ![alt text](images/qgp-output-backside.png)
 
 ### Subnet 2 - Plasma Storage
-The purpose of this setup is to buffer plasmas and feed the correct amounts as demanded to both modules via ordering patterns. Place a neutronium controller, a wireless hub (connections to this hub will always be blue), and two ME Drives full of 16384k cells. There will be 90 types of plasmas to buffer, so you need at least 18 cells. 
+The purpose of this subnet is to buffer plasmas and feed the correct amounts as demanded to both modules via ordering patterns. Place a neutronium controller, a wireless hub (connections to this hub will always be blue), and two ME Drives full of 16384k cells. There will be 90 types of plasmas to buffer, so you need at least 18 cells. 
 
 Additionally, place a T3 computer case, computer screen, keyboard, and cable leading to an OC p2p on the plasma subnet. We will deal with the computer setup at the end.
 
@@ -108,4 +108,4 @@ If everything has worked properly, it should immediately start ordering plasmas 
 - Probably more, let me know and I'll fix them.
 
 ## Configuration Options
-- By default, this feeds materials purely as dusts. That's inconvenient, so at the top of the file there is a template for telling it you'd prefer some inputs at fluids instead. Configurations already exist for dragonblood and infinity, and I will probably be adding more. If you have something stocked as a fluid you do not need to maintain it on main, you can instead tell the script to use that. 
+- By default, this feeds materials purely as dusts. That's inconvenient, so at the top of the file there is a template for telling it you'd prefer some inputs at fluids instead. Configurations already exist for several of the magmatter exotic materials, and you can feel free to add more.
