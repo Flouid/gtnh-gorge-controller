@@ -42,6 +42,30 @@ FABRICATOR_SOURCE_OVERRIDES = {
         label = "Molten Dragonblood",
         type = "FLUID",
         batchAmount = 144 * BATCH_MULTIPLIER
+    },
+    ["Celestial Tungsten Dust"] = {
+        name = "molten.celestialtungsten",
+        label = "Molten Celestial Tungsten",
+        type = "FLUID",
+        batchAmount = 144 * BATCH_MULTIPLIER
+    },
+    ["Hypogen Dust"] = {
+        name = "molten.hypogen",
+        label = "Molten Hypogen",
+        type = "FLUID",
+        batchAmount = 144 * BATCH_MULTIPLIER
+    },
+    ["Chromatic Glass Dust"] = {
+        name = "molten.chromaticglass",
+        label = "Molten Chromatic Glass",
+        type = "FLUID",
+        batchAmount = 144 * BATCH_MULTIPLIER
+    },
+    ["Rhugnor Dust"] = {
+        name = "molten.rhugnor",
+        label = "Molten Rhugnor",
+        type = "FLUID",
+        batchAmount = 144 * BATCH_MULTIPLIER
     }
 }
 
@@ -268,7 +292,7 @@ end
 -- Networking & Auto updates
 -- ============================================================
 
-local VERSION = "1.3.0"
+local VERSION = "1.3.3"
 local UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/VERSION"
 local UPDATE_SCRIPT_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/gorge-controller.lua"
 
