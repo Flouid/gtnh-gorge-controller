@@ -13,6 +13,7 @@ local event = require("event")
 -- config
 -- ============================================================
 
+ENABLE_AUTO_UPDATE = true
 ENABLE_QGP = true
 ENABLE_MAGMATTER = true
 DEBUG = false
@@ -1123,7 +1124,7 @@ end
 -- ============================================================
 
 ensureAutorun()
-checkForUpdate()
+if ENABLE_AUTO_UPDATE then checkForUpdate() end
 
 if update_applied then
     computer.shutdown(true)
