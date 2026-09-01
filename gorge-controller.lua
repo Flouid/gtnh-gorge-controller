@@ -29,6 +29,7 @@ IO_SLOT_COUNT = 6
 QGP_OUTPUT_MARKER_SLOT = 11
 MAGMATTER_OUTPUT_MARKER_SLOT = 12
 OUTPUT_SETTLE_TIME = 0.1
+OUTPUT_RESCAN_INTERVAL = 60
 
 FABRICATOR_SOURCE_OVERRIDES = {
     ["Infinity Dust"] = {
@@ -292,7 +293,7 @@ end
 -- Networking & Auto updates
 -- ============================================================
 
-local VERSION = "1.3.3"
+local VERSION = "1.3.4"
 local UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/VERSION"
 local UPDATE_SCRIPT_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/gorge-controller.lua"
 
@@ -732,6 +733,13 @@ local function setState(module, newState)
     if module.state == newState then return end
 
     module.state = newState
+
+    if newState == STATE_WAIT_OUTPUT then
+        module.outputRescanAt = computer.uptime() + OUTPUT_RESCAN_INTERVAL
+    else
+        module.outputRescanAt = nil
+    end
+
     renderModule(module)
 
     if updateSubscriptions then
@@ -1028,9 +1036,15 @@ local function getNextTimer()
     local nextTimer
 
     for _, module in ipairs(Modules) do
-        if module.enabled and module.fabricatorRetryAt then
-            if not nextTimer or module.fabricatorRetryAt < nextTimer then
+        if module.enabled then
+            if module.fabricatorRetryAt
+                and (not nextTimer or module.fabricatorRetryAt < nextTimer) then
                 nextTimer = module.fabricatorRetryAt
+            end
+
+            if module.outputRescanAt
+                and (not nextTimer or module.outputRescanAt < nextTimer) then
+                nextTimer = module.outputRescanAt
             end
         end
     end
@@ -1046,6 +1060,14 @@ local function handleTimers()
             and module.fabricatorRetryAt
             and now >= module.fabricatorRetryAt then
             handleFabricatorTimer(module)
+        end
+
+        if module.enabled
+            and module.state == STATE_WAIT_OUTPUT
+            and module.outputRescanAt
+            and now >= module.outputRescanAt then
+            module.outputRescanAt = now + OUTPUT_RESCAN_INTERVAL
+            advanceModule(module)
         end
     end
 
