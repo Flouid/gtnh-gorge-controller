@@ -1,11 +1,11 @@
 -- Gorge Controller
 -- Author: flouid
 -- Automates QGP and Magmatter Exoticiser cycles.
+-- Experimental compatibility build for GTNH 2.8.4 / OpenComputers 1.11.20.
+-- Requires an OpenComputers Database Upgrade in the computer.
 -- Ctrl+Alt+C to exit.
 
 -- credit where it's due, much of this is stolen Armisael's BEC script: https://github.com/Armisael5/gtnh-bec-controller/tree/main
-
--- WARNING: This is an LLM-generated backport to 2.8.4. I make no guarantees about correctness
 
 local component = require("component")
 local computer = require("computer")
@@ -15,6 +15,7 @@ local event = require("event")
 -- config
 -- ============================================================
 
+-- Keep this disabled: the main update channel targets newer GTNH versions.
 ENABLE_AUTO_UPDATE = false
 ENABLE_QGP = true
 ENABLE_MAGMATTER = true
@@ -31,7 +32,8 @@ IO_SLOT_COUNT = 6
 QGP_OUTPUT_MARKER_SLOT = 11
 MAGMATTER_OUTPUT_MARKER_SLOT = 12
 OUTPUT_SETTLE_TIME = 0.1
-OUTPUT_RESCAN_INTERVAL = 60
+LEGACY_POLL_INTERVAL = 5
+LEGACY_FLUID_DROP_ITEM = "ae2fc:fluid_drop"
 
 FABRICATOR_SOURCE_OVERRIDES = {
     ["Infinity Dust"] = {
@@ -180,14 +182,38 @@ MAGMATTER_ATLAS = {
 -- ============================================================
 
 local function findMarkedInterface(label)
-    for address in component.list("fluid_interface", true) do
-        local proxy = component.proxy(address)
-        local ok, pattern = pcall(proxy.getInterfacePattern, 1)
+    for address, componentType in component.list() do
+        if componentType == "fluid_interface"
+            or componentType == "me_interface" then
+            local proxy = component.proxy(address)
+            local ok, pattern = pcall(proxy.getInterfacePattern, 1)
 
-        if ok and pattern and pattern.outputs then
-            for _, output in pairs(pattern.outputs) do
-                if output.label == label then
-                    return proxy
+            if ok and pattern and pattern.outputs then
+                for outputIndex, output in pairs(pattern.outputs) do
+                    if output.label == label then
+                        return proxy
+                    end
+
+                    -- OC 1.11.20's pattern converter discards custom stack
+                    -- names and exposes only the base item name (for example,
+                    -- "Paper"). Store the actual output in the Database Upgrade
+                    -- so the normal item converter can expose its custom label.
+                    local storeOk, stored = pcall(
+                        proxy.storeInterfacePatternOutput,
+                        1,
+                        outputIndex,
+                        LegacyDatabaseAddress,
+                        1
+                    )
+
+                    if storeOk and stored then
+                        local getOk, storedOutput = pcall(LegacyDatabase.get, 1)
+
+                        if getOk and storedOutput
+                            and storedOutput.label == label then
+                            return proxy
+                        end
+                    end
                 end
             end
         end
@@ -295,7 +321,7 @@ end
 -- Networking & Auto updates
 -- ============================================================
 
-local VERSION = "1.3.5"
+local VERSION = "1.3.5-2.8.4-experimental.2"
 local UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/VERSION"
 local UPDATE_SCRIPT_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/gorge-controller.lua"
 
@@ -371,7 +397,8 @@ FabricatorRecipe = nil
 FabricatorPatternSize = 0
 FabricatorOwner = nil
 PlasmaMonitorInterface = nil
-PlasmaSubscribed = false
+LegacyDatabase = nil
+LegacyDatabaseAddress = nil
 GPU = nil
 DisplayWidth = 0
 DisplayHeight = 0
@@ -486,24 +513,40 @@ local function getPatternSize(interface)
 end
 
 local function clearUnusedPatternInputs(interface, first, previousSize)
-    for slot = first, previousSize do
+    -- Removing an entry shifts later pattern inputs left. Clear backwards to
+    -- avoid skipping entries or addressing beyond the shortened list.
+    for slot = previousSize, first, -1 do
         interface.clearInterfacePatternInput(1, slot)
     end
 end
 
 local function setPatternInput(interface, slot, source, type, amount)
+    local itemName
+    local damage = 0
+    local nbt
+
     if type == "ITEM" then
-        interface.setInterfacePatternInput(1, slot, {
-            name = source.name,
-            damage = source.damage,
-            size = amount
-        }, "item")
+        itemName = source.name
+        damage = source.damage or 0
     else
-        interface.setInterfacePatternInput(1, slot, {
-            name = source.name,
-            size = amount
-        }, "fluid")
+        itemName = LEGACY_FLUID_DROP_ITEM
+        nbt = '{Fluid:"' .. source.name .. '"}'
     end
+
+    local stored, reason = LegacyDatabase.set(1, itemName, damage, nbt)
+    assert(stored, "failed to create legacy pattern entry: " .. tostring(reason))
+
+    -- OpenComputers 1.11.20 only accepts pattern inputs through a Database:
+    -- pattern slot, database address, database entry, amount, input index.
+    local written = interface.setInterfacePatternInput(
+        1,
+        LegacyDatabaseAddress,
+        1,
+        amount,
+        slot
+    )
+
+    assert(written, "failed to write legacy interface pattern input")
 end
 
 local function orderPattern(recipe)
@@ -524,7 +567,12 @@ local function printMaterialShortages(module)
                 source.damage
             )
         else
-            stored = FabricatorInterface.getFluidInNetwork(source.name)
+            for _, fluid in pairs(FabricatorInterface.getFluidsInNetwork()) do
+                if fluid.name == source.name then
+                    stored = fluid
+                    break
+                end
+            end
         end
 
         local available = stored and (stored.size or stored.amount) or 0
@@ -729,89 +777,20 @@ local function renderModule(module)
     GPU.set(1, module.displayRow, text .. string.rep(" ", DisplayWidth - #text))
 end
 
-local updateSubscriptions
-
 local function setState(module, newState)
     if module.state == newState then return end
 
     module.state = newState
 
     if newState == STATE_WAIT_OUTPUT
-        or newState == STATE_WAIT_OUTPUT_EMPTY then
-        module.outputRescanAt = computer.uptime() + OUTPUT_RESCAN_INTERVAL
+        or newState == STATE_WAIT_OUTPUT_EMPTY
+        or newState == STATE_WAIT_PLASMA then
+        module.pollAt = computer.uptime() + LEGACY_POLL_INTERVAL
     else
-        module.outputRescanAt = nil
+        module.pollAt = nil
     end
 
     renderModule(module)
-
-    if updateSubscriptions then
-        updateSubscriptions()
-    end
-end
-
--- ============================================================
--- event subscriptions
--- ============================================================
-
-local function setOutputSubscription(module, enabled)
-    if not module.enabled or module.outputSubscribed == enabled then return end
-
-    module.outputInterface.setItemEventSubscription(enabled)
-    module.outputInterface.setFluidEventSubscription(enabled)
-    module.outputSubscribed = enabled
-end
-
-updateSubscriptions = function()
-    for _, module in ipairs(Modules) do
-        if module.enabled then
-            local wantsOutput =
-                module.state == STATE_WAIT_OUTPUT
-                or module.state == STATE_WAIT_OUTPUT_EMPTY
-
-            setOutputSubscription(module, wantsOutput)
-        end
-    end
-
-    local wantsPlasma = false
-
-    for _, module in ipairs(Modules) do
-        if module.enabled and module.state == STATE_WAIT_PLASMA then
-            wantsPlasma = true
-            break
-        end
-    end
-
-    if PlasmaMonitorInterface and PlasmaSubscribed ~= wantsPlasma then
-        PlasmaMonitorInterface.setFluidEventSubscription(wantsPlasma)
-        PlasmaSubscribed = wantsPlasma
-    end
-end
-
-local function pullDebounced(timeout)
-    local eventName
-
-    if timeout then
-        eventName = event.pull(timeout)
-    else
-        eventName = event.pull()
-    end
-
-    if eventName ~= "network_item_changed"
-        and eventName ~= "network_fluid_changed" then
-        return eventName
-    end
-
-    local deadline = computer.uptime() + 0.05
-
-    while true do
-        local remaining = deadline - computer.uptime()
-        if remaining <= 0 then break end
-
-        event.pull(remaining)
-    end
-
-    return eventName
 end
 
 -- ============================================================
@@ -918,8 +897,8 @@ finishPlasmaWait = function(module)
     module.fabricatorRetryAt = nil
     module.missingPlasma = nil
 
-    -- Subscribe to this module's output before ordering the input pattern so
-    -- an extremely fast Exoticizer cycle cannot finish before we are listening.
+    -- Begin polling this module's output before ordering the input pattern so
+    -- an extremely fast Exoticizer cycle is still detected on the next poll.
     setState(module, STATE_WAIT_OUTPUT)
 
     local craft = feedPlasma(module)
@@ -940,18 +919,12 @@ local function checkExoticizerCraft(module)
     module.exoticizerCraft = nil
 end
 
-local function advanceModule(module, eventName, plasmaStock)
+local function advanceModule(module, plasmaStock)
     if not module.enabled then return end
 
     checkExoticizerCraft(module)
 
     if module.state == STATE_WAIT_OUTPUT then
-        if eventName
-            and eventName ~= "network_item_changed"
-            and eventName ~= "network_fluid_changed" then
-            return
-        end
-
         local items, fluids = checkForOutputs(module)
         if not items then return end
 
@@ -964,12 +937,6 @@ local function advanceModule(module, eventName, plasmaStock)
     end
 
     if module.state == STATE_WAIT_OUTPUT_EMPTY then
-        if eventName
-            and eventName ~= "network_item_changed"
-            and eventName ~= "network_fluid_changed" then
-            return
-        end
-
         if not checkOutputEmpty(module) then return end
 
         finishFlushOutputs(module)
@@ -995,8 +962,6 @@ local function advanceModule(module, eventName, plasmaStock)
     end
 
     if module.state == STATE_WAIT_PLASMA then
-        if eventName ~= "network_fluid_changed" then return end
-
         module.missingPlasma = getMissingPlasma(module.demand, plasmaStock)
 
         if next(module.missingPlasma) == nil then
@@ -1005,35 +970,12 @@ local function advanceModule(module, eventName, plasmaStock)
     end
 end
 
-local function advanceQGP(eventName, plasmaStock)
-    advanceModule(QGP, eventName, plasmaStock)
+local function advanceQGP(plasmaStock)
+    advanceModule(QGP, plasmaStock)
 end
 
-local function advanceMagmatter(eventName, plasmaStock)
-    advanceModule(Magmatter, eventName, plasmaStock)
-end
-
-local function dispatchEvent(eventName)
-    local plasmaStock
-
-    if eventName == "network_fluid_changed" then
-        for _, module in ipairs(Modules) do
-            if module.enabled and module.state == STATE_WAIT_PLASMA then
-                plasmaStock = getPlasmaStock()
-                break
-            end
-        end
-    end
-
-    if ENABLE_QGP then
-        advanceQGP(eventName, plasmaStock)
-    end
-
-    if ENABLE_MAGMATTER then
-        advanceMagmatter(eventName, plasmaStock)
-    end
-
-    serviceFabricatorQueue()
+local function advanceMagmatter(plasmaStock)
+    advanceModule(Magmatter, plasmaStock)
 end
 
 local function getNextTimer()
@@ -1046,9 +988,9 @@ local function getNextTimer()
                 nextTimer = module.fabricatorRetryAt
             end
 
-            if module.outputRescanAt
-                and (not nextTimer or module.outputRescanAt < nextTimer) then
-                nextTimer = module.outputRescanAt
+            if module.pollAt
+                and (not nextTimer or module.pollAt < nextTimer) then
+                nextTimer = module.pollAt
             end
         end
     end
@@ -1058,6 +1000,7 @@ end
 
 local function handleTimers()
     local now = computer.uptime()
+    local plasmaStock
 
     for _, module in ipairs(Modules) do
         if module.enabled
@@ -1066,13 +1009,14 @@ local function handleTimers()
             handleFabricatorTimer(module)
         end
 
-        if module.enabled
-            and (module.state == STATE_WAIT_OUTPUT
-                or module.state == STATE_WAIT_OUTPUT_EMPTY)
-            and module.outputRescanAt
-            and now >= module.outputRescanAt then
-            module.outputRescanAt = now + OUTPUT_RESCAN_INTERVAL
-            advanceModule(module)
+        if module.enabled and module.pollAt and now >= module.pollAt then
+            module.pollAt = now + LEGACY_POLL_INTERVAL
+
+            if module.state == STATE_WAIT_PLASMA and not plasmaStock then
+                plasmaStock = getPlasmaStock()
+            end
+
+            advanceModule(module, plasmaStock)
         end
     end
 
@@ -1124,8 +1068,6 @@ local function discoverModule(module)
 
     module.inputRecipe = module.inputInterface.getCraftables({label = module.inputMarker})[1]
     assert(module.inputRecipe, "could not find " .. module.name .. " input pattern")
-
-    module.outputSubscribed = false
 end
 
 local function startup()
@@ -1136,6 +1078,15 @@ local function startup()
     end
 
     print("Discovering components...")
+
+    if ENABLE_QGP or ENABLE_MAGMATTER then
+        LegacyDatabaseAddress = component.list("database", true)()
+        assert(
+            LegacyDatabaseAddress,
+            "GTNH 2.8.4 compatibility requires an OC Database Upgrade"
+        )
+        LegacyDatabase = component.proxy(LegacyDatabaseAddress)
+    end
 
     if ENABLE_QGP then
         discoverModule(QGP)
@@ -1199,8 +1150,6 @@ if ENABLE_MAGMATTER then
     advanceMagmatter()
 end
 
-updateSubscriptions()
-
 while true do
     handleTimers()
 
@@ -1211,10 +1160,5 @@ while true do
         timeout = math.max(0, nextTimer - computer.uptime())
     end
 
-    local eventName = pullDebounced(timeout)
-
-    if eventName == "network_item_changed"
-        or eventName == "network_fluid_changed" then
-        dispatchEvent(eventName)
-    end
+    event.pull(timeout)
 end
