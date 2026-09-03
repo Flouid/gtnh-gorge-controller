@@ -5,6 +5,8 @@
 
 -- credit where it's due, much of this is stolen Armisael's BEC script: https://github.com/Armisael5/gtnh-bec-controller/tree/main
 
+-- WARNING: This is an LLM-generated backport to 2.8.4. I make no guarantees about correctness
+
 local component = require("component")
 local computer = require("computer")
 local event = require("event")
@@ -13,7 +15,7 @@ local event = require("event")
 -- config
 -- ============================================================
 
-ENABLE_AUTO_UPDATE = true
+ENABLE_AUTO_UPDATE = false
 ENABLE_QGP = true
 ENABLE_MAGMATTER = true
 DEBUG = false
@@ -270,7 +272,7 @@ end
 -- auto run & updates
 -- ============================================================
 
-local SCRIPT_PATH = "/home/gorge-controller.lua"
+local SCRIPT_PATH = "/home/gorge-controller-legacy.lua"
 local SHRC_PATH = "/home/.shrc"
 
 local function ensureAutorun()

@@ -1,3 +1,10 @@
+## Disclaimer
+This script is written against the 2.9.x OC APIs. I have provided an llm-generated backport to 2.8.4 that I hope is a drop-in replacement, but I cannot guarantee this will work as well as the main 2.9.x version since I have not personally tested/validated it. 
+
+Install the legacy version with:
+
+`wget https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/gorge-controller-legacy.lua && /home/gorge-controller-legacy.lua && gorge-controller-legacy`
+
 ## Design Principles
 The concept behind this automation is that any given craft uses a relatively small amount of plasma, ordering patterns is slow and relatively expensive for performance, and it's inefficient to use a plasma fabricator to do only a few kL of plasma at a time. So, we endeavor to instead keep a healthy stock of all available plasmas on hand and feed them into the module (QGP and/or Magmatter) the moment we know what the demand is. When we get low, we order a new batch from the dedicated plasma fabricator.
 
