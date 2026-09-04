@@ -30,7 +30,8 @@ QGP_OUTPUT_MARKER_SLOT = 11
 MAGMATTER_OUTPUT_MARKER_SLOT = 12
 OUTPUT_RESCAN_INTERVAL = 10
 EVENT_DEBOUNCE_TIME = 0.05
-DRIVE_RESCAN_INITIAL_INTERVAL = 0.5
+DRIVE_RESCAN_INITIAL_INTERVAL = 0.1
+DRIVE_RECOVERY_RESCAN_INITIAL_INTERVAL = 0.5
 DRIVE_RESCAN_MAX_INTERVAL = 5
 DRIVE_RECOVERY_TIMEOUT = 60
 
@@ -425,7 +426,7 @@ end
 -- Networking & Auto updates
 -- ============================================================
 
-local VERSION = "1.3.7"
+local VERSION = "1.3.8"
 local UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/VERSION"
 local UPDATE_SCRIPT_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/gorge-controller.lua"
 
@@ -539,16 +540,16 @@ local STATE_WAIT_OUTPUT = 1
 local STATE_WAIT_OUTPUT_EMPTY = 2
 local STATE_WAIT_FABRICATOR = 3
 local STATE_WAIT_PLASMA = 4
-local STATE_WAIT_DRIVES_READY = 5
-local STATE_WAIT_DRIVES_RETURN = 6
+local STATE_WAIT_DRIVES_TO_FLUSH = 5
+local STATE_WAIT_DRIVES_FILLED = 6
 
 local STATE_DISPLAY = {
     [STATE_WAIT_OUTPUT] = "Waiting for exoticizer outputs",
     [STATE_WAIT_OUTPUT_EMPTY] = "Flushing outputs to main",
     [STATE_WAIT_FABRICATOR] = "Waiting for fabricator",
     [STATE_WAIT_PLASMA] = "Waiting for plasma",
-    [STATE_WAIT_DRIVES_READY] = "Waiting for output drives",
-    [STATE_WAIT_DRIVES_RETURN] = "Returning output drives"
+    [STATE_WAIT_DRIVES_TO_FLUSH] = "Waiting for returned drives",
+    [STATE_WAIT_DRIVES_FILLED] = "Waiting for filled output drives"
 }
 
 local QGP = {
@@ -608,7 +609,7 @@ end
 
 local function recoverOutputDrivesAtStartup(module)
     local deadline = computer.uptime() + DRIVE_RECOVERY_TIMEOUT
-    local retryDelay = DRIVE_RESCAN_INITIAL_INTERVAL
+    local retryDelay = DRIVE_RECOVERY_RESCAN_INITIAL_INTERVAL
     local recovering = false
     local lastLayout
     local lastOutputError
@@ -847,15 +848,7 @@ local function checkForOutputs(module)
     end
 end
 
-local function flushOutputs(module)
-    local drives = getDriveSlots(module.outputShuttle, module.outputShuttle.otherSide)
-
-    if #drives ~= module.outputDriveCount then
-        local layout = scanOutputDriveLayout(module)
-        error("cannot start " .. module.name .. " output flush; "
-            .. describeOutputDriveLayout(module, layout))
-    end
-
+local function flushOutputs(module, drives)
     moveDriveSlots(
         module.outputShuttle,
         module.outputShuttle.otherSide,
@@ -1039,8 +1032,8 @@ local function setState(module, newState)
         module.outputRescanAt = nil
     end
 
-    if newState == STATE_WAIT_DRIVES_READY
-        or newState == STATE_WAIT_DRIVES_RETURN then
+    if newState == STATE_WAIT_DRIVES_TO_FLUSH
+        or newState == STATE_WAIT_DRIVES_FILLED then
         local now = computer.uptime()
         module.driveWaitStartedAt = now
         module.driveRetryDelay = math.min(
@@ -1095,34 +1088,26 @@ updateSubscriptions = function()
     end
 end
 
-local function recordEvent(batch, eventName, sourceAddress)
+-- AE2 subscription signals contain changed stacks after the event name, not
+-- the emitting interface address. Batch by event type: filtering by the next
+-- value would discard real events and force the 10-second safety rescan.
+local function recordEvent(batch, eventName)
     if not eventName then return end
 
     batch.types[eventName] = true
-
-    local sources = batch.sources[eventName]
-    if not sources then
-        sources = {}
-        batch.sources[eventName] = sources
-    end
-
-    -- A normal component signal always has a source address. Preserve a
-    -- source-less event as a wildcard so a malformed or synthetic signal
-    -- still causes a safe rescan rather than being ignored.
-    sources[sourceAddress or false] = true
 end
 
 local function pullDebounced(timeout)
-    local batch = {types = {}, sources = {}}
-    local eventName, sourceAddress
+    local batch = {types = {}}
+    local eventName
 
     if timeout then
-        eventName, sourceAddress = event.pull(timeout)
+        eventName = event.pull(timeout)
     else
-        eventName, sourceAddress = event.pull()
+        eventName = event.pull()
     end
 
-    recordEvent(batch, eventName, sourceAddress)
+    recordEvent(batch, eventName)
 
     if eventName ~= "network_item_changed"
         and eventName ~= "network_fluid_changed" then
@@ -1135,26 +1120,20 @@ local function pullDebounced(timeout)
         local remaining = deadline - computer.uptime()
         if remaining <= 0 then break end
 
-        local nextEvent, nextSource = event.pull(remaining)
-        recordEvent(batch, nextEvent, nextSource)
+        local nextEvent = event.pull(remaining)
+        recordEvent(batch, nextEvent)
     end
 
     return batch
 end
 
-local function hasInterfaceEvent(batch, eventName, interface)
-    if not batch or not batch.types[eventName] then return false end
-
-    local sources = batch.sources[eventName]
-    if not sources or sources[false] then return true end
-
-    local address = interface and interface.address
-    return not address or sources[address] == true
+local function hasEvent(batch, eventName)
+    return batch and batch.types[eventName] == true
 end
 
-local function hasOutputEvent(batch, module)
-    return hasInterfaceEvent(batch, "network_item_changed", module.outputInterface)
-        or hasInterfaceEvent(batch, "network_fluid_changed", module.outputInterface)
+local function hasOutputEvent(batch)
+    return hasEvent(batch, "network_item_changed")
+        or hasEvent(batch, "network_fluid_changed")
 end
 
 -- ============================================================
@@ -1309,7 +1288,7 @@ local function advanceModule(module, eventBatch, plasmaStock)
     checkExoticizerCraft(module)
 
     if module.state == STATE_WAIT_OUTPUT then
-        if eventBatch and not hasOutputEvent(eventBatch, module) then return end
+        if eventBatch and not hasOutputEvent(eventBatch) then return end
 
         -- An event-driven scan is as useful as a timer-driven scan. Move the
         -- fallback out so a timer does not immediately duplicate this work,
@@ -1323,50 +1302,46 @@ local function advanceModule(module, eventBatch, plasmaStock)
         module.cycleFluids = fluids
         module.needsFreshChallenge = nil
 
+        local drives = getDriveSlots(
+            module.outputShuttle,
+            module.outputShuttle.otherSide
+        )
+
+        if #drives ~= module.outputDriveCount then
+            setState(module, STATE_WAIT_DRIVES_TO_FLUSH)
+            return
+        end
+
+        -- Subscribe before moving the cells so a very fast flush cannot
+        -- empty the output subnet before we start listening for its event.
         setState(module, STATE_WAIT_OUTPUT_EMPTY)
-        flushOutputs(module)
+        flushOutputs(module, drives)
         return
     end
 
     if module.state == STATE_WAIT_OUTPUT_EMPTY then
-        if eventBatch and not hasOutputEvent(eventBatch, module) then return end
+        if eventBatch and not hasOutputEvent(eventBatch) then return end
 
         module.outputRescanAt = computer.uptime() + OUTPUT_RESCAN_INTERVAL
 
         if not checkOutputEmpty(module) then return end
 
         if not finishFlushOutputs(module) then
-            setState(module, STATE_WAIT_DRIVES_READY)
+            setState(module, STATE_WAIT_DRIVES_FILLED)
             return
         end
 
-        setState(module, STATE_WAIT_DRIVES_RETURN)
+        -- The main I/O Port can empty the cells while this module calculates
+        -- demand, fills plasma, and runs its next Exoticizer cycle. Verify
+        -- their return only if the next output flush actually needs them.
+        continueAfterOutputFlush(module, plasmaStock)
         return
     end
 
-    if module.state == STATE_WAIT_DRIVES_READY then
-        -- Once the output network is confirmed empty, only the I/O Port
-        -- needs attention. Ignore unrelated network events and poll just the
-        -- output-subnet output slots on the dedicated retry timer.
-        if eventBatch then return end
-
-        if not finishFlushOutputs(module) then
-            scheduleDriveRetry(
-                module,
-                "driveRescanAt",
-                "output drives to finish filling"
-            )
-            return
-        end
-
-        setState(module, STATE_WAIT_DRIVES_RETURN)
-        return
-    end
-
-    if module.state == STATE_WAIT_DRIVES_RETURN then
-        -- Transposer/I/O Port movement does not provide a dependable event.
-        -- Only the dedicated retry timer may inspect this state, avoiding a
-        -- drive scan for unrelated network events.
+    if module.state == STATE_WAIT_DRIVES_TO_FLUSH then
+        -- The next challenge is already cached. Poll only the six main-side
+        -- output slots until the previous cells finish emptying, then start
+        -- this flush without putting drive return on every cycle's hot path.
         if eventBatch then return end
 
         local drives = getDriveSlots(
@@ -1383,16 +1358,32 @@ local function advanceModule(module, eventBatch, plasmaStock)
             return
         end
 
+        setState(module, STATE_WAIT_OUTPUT_EMPTY)
+        flushOutputs(module, drives)
+        return
+    end
+
+    if module.state == STATE_WAIT_DRIVES_FILLED then
+        -- Once the output network is confirmed empty, only the I/O Port
+        -- needs attention. Ignore unrelated network events and poll just the
+        -- output-subnet output slots on the dedicated retry timer.
+        if eventBatch then return end
+
+        if not finishFlushOutputs(module) then
+            scheduleDriveRetry(
+                module,
+                "driveRescanAt",
+                "output drives to finish filling"
+            )
+            return
+        end
+
         continueAfterOutputFlush(module, plasmaStock)
         return
     end
 
     if module.state == STATE_WAIT_PLASMA then
-        if not hasInterfaceEvent(
-            eventBatch,
-            "network_fluid_changed",
-            PlasmaMonitorInterface
-        ) then
+        if not hasEvent(eventBatch, "network_fluid_changed") then
             return
         end
 
@@ -1415,11 +1406,7 @@ end
 local function dispatchEvents(eventBatch)
     local plasmaStock
 
-    if hasInterfaceEvent(
-        eventBatch,
-        "network_fluid_changed",
-        PlasmaMonitorInterface
-    ) then
+    if hasEvent(eventBatch, "network_fluid_changed") then
         for _, module in ipairs(Modules) do
             if module.enabled and module.state == STATE_WAIT_PLASMA then
                 plasmaStock = getPlasmaStock()
@@ -1483,8 +1470,8 @@ local function handleTimers()
         end
 
         if module.enabled
-            and (module.state == STATE_WAIT_DRIVES_READY
-                or module.state == STATE_WAIT_DRIVES_RETURN)
+            and (module.state == STATE_WAIT_DRIVES_TO_FLUSH
+                or module.state == STATE_WAIT_DRIVES_FILLED)
             and module.driveRescanAt
             and now >= module.driveRescanAt then
             advanceModule(module)
