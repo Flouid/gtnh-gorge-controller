@@ -28,8 +28,11 @@ IO_OUTPUT_FIRST_SLOT = 7
 IO_SLOT_COUNT = 6
 QGP_OUTPUT_MARKER_SLOT = 11
 MAGMATTER_OUTPUT_MARKER_SLOT = 12
-OUTPUT_SETTLE_TIME = 0.1
-OUTPUT_RESCAN_INTERVAL = 60
+OUTPUT_RESCAN_INTERVAL = 10
+EVENT_DEBOUNCE_TIME = 0.05
+DRIVE_RESCAN_INITIAL_INTERVAL = 0.5
+DRIVE_RESCAN_MAX_INTERVAL = 5
+DRIVE_RECOVERY_TIMEOUT = 60
 
 FABRICATOR_SOURCE_OVERRIDES = {
     ["Infinity Dust"] = {
@@ -236,15 +239,20 @@ local function findTransposerByMarkerSlot(markerSlot)
     return nil
 end
 
-local function getDriveSlots(shuttle, side)
+local function scanOccupiedSlots(shuttle, side, firstSlot, errors, regionName)
     local slots = {}
 
-    for slot = IO_OUTPUT_FIRST_SLOT, IO_OUTPUT_FIRST_SLOT + IO_SLOT_COUNT - 1 do
+    for slot = firstSlot, firstSlot + IO_SLOT_COUNT - 1 do
         if not (side == shuttle.markerSide and slot == shuttle.markerSlot) then
             local ok, stack = pcall(shuttle.proxy.getStackInSlot, side, slot)
 
             if ok and stack then
                 table.insert(slots, slot)
+            elseif not ok and errors then
+                table.insert(
+                    errors,
+                    regionName .. " slot " .. slot .. ": " .. tostring(stack)
+                )
             end
         end
     end
@@ -252,18 +260,142 @@ local function getDriveSlots(shuttle, side)
     return slots
 end
 
-local function moveDriveSlots(shuttle, sourceSide, targetSide, slots)
+local function getDriveSlots(shuttle, side)
+    return scanOccupiedSlots(shuttle, side, IO_OUTPUT_FIRST_SLOT)
+end
+
+local function scanOutputDriveLayout(module)
+    local shuttle = module.outputShuttle
+    local errors = {}
+    local layout = {
+        errors = errors,
+        markerInput = scanOccupiedSlots(
+            shuttle,
+            shuttle.markerSide,
+            IO_INPUT_FIRST_SLOT,
+            errors,
+            "output-subnet input"
+        ),
+        markerOutput = scanOccupiedSlots(
+            shuttle,
+            shuttle.markerSide,
+            IO_OUTPUT_FIRST_SLOT,
+            errors,
+            "output-subnet output"
+        ),
+        mainInput = scanOccupiedSlots(
+            shuttle,
+            shuttle.otherSide,
+            IO_INPUT_FIRST_SLOT,
+            errors,
+            "main-side input"
+        ),
+        mainOutput = scanOccupiedSlots(
+            shuttle,
+            shuttle.otherSide,
+            IO_OUTPUT_FIRST_SLOT,
+            errors,
+            "main-side output"
+        )
+    }
+
+    layout.total = #layout.markerInput
+        + #layout.markerOutput
+        + #layout.mainInput
+        + #layout.mainOutput
+
+    return layout
+end
+
+local function formatSlotList(slots)
+    if #slots == 0 then return "[]" end
+
+    local values = {}
+    for _, slot in ipairs(slots) do
+        table.insert(values, tostring(slot))
+    end
+
+    return "[" .. table.concat(values, ", ") .. "]"
+end
+
+local function describeOutputDriveLayout(module, layout)
+    local description = module.name .. " output drives: expected "
+        .. module.outputDriveCount .. ", found " .. layout.total
+        .. "; output-subnet input=" .. formatSlotList(layout.markerInput)
+        .. ", output-subnet output=" .. formatSlotList(layout.markerOutput)
+        .. ", main-side input=" .. formatSlotList(layout.mainInput)
+        .. ", main-side output=" .. formatSlotList(layout.mainOutput)
+
+    if #layout.errors > 0 then
+        description = description .. "; scan errors="
+            .. table.concat(layout.errors, " | ")
+    end
+
+    return description
+end
+
+local function getFreeInputSlots(occupiedSlots)
+    local occupied = {}
+    local free = {}
+
+    for _, slot in ipairs(occupiedSlots) do
+        occupied[slot] = true
+    end
+
+    for slot = IO_INPUT_FIRST_SLOT, IO_INPUT_FIRST_SLOT + IO_SLOT_COUNT - 1 do
+        if not occupied[slot] then
+            table.insert(free, slot)
+        end
+    end
+
+    return free
+end
+
+local function moveDriveSlots(shuttle, sourceSide, targetSide, slots, targetSlots)
     for i, sourceSlot in ipairs(slots) do
-        local moved = shuttle.proxy.transferItem(
+        local targetSlot = targetSlots
+            and targetSlots[i]
+            or IO_INPUT_FIRST_SLOT + i - 1
+        local ok, moved = pcall(
+            shuttle.proxy.transferItem,
             sourceSide,
             targetSide,
             1,
             sourceSlot,
-            IO_INPUT_FIRST_SLOT + i - 1
+            targetSlot
         )
 
-        assert(moved and moved > 0, "failed to move output drive")
+        assert(
+            ok and moved and moved > 0,
+            "failed to move output drive from side " .. sourceSide
+                .. " slot " .. sourceSlot .. " to side " .. targetSide
+                .. " slot " .. targetSlot .. ": " .. tostring(moved)
+        )
     end
+end
+
+local function moveDriveSlotsToFreeInputs(
+    shuttle,
+    sourceSide,
+    targetSide,
+    sourceSlots,
+    occupiedTargetSlots
+)
+    local freeSlots = getFreeInputSlots(occupiedTargetSlots)
+
+    assert(
+        #freeSlots >= #sourceSlots,
+        "not enough free IO Port input slots to move " .. #sourceSlots
+            .. " output drives"
+    )
+
+    moveDriveSlots(
+        shuttle,
+        sourceSide,
+        targetSide,
+        sourceSlots,
+        freeSlots
+    )
 end
 
 -- ============================================================
@@ -293,7 +425,7 @@ end
 -- Networking & Auto updates
 -- ============================================================
 
-local VERSION = "1.3.6"
+local VERSION = "1.3.7"
 local UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/VERSION"
 local UPDATE_SCRIPT_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/gorge-controller.lua"
 
@@ -335,16 +467,45 @@ end
 
 local update_applied = false;
 
+local function isNewerVersion(candidate, current)
+    local candidateMajor, candidateMinor, candidatePatch =
+        candidate:match("^(%d+)%.(%d+)%.(%d+)$")
+    local currentMajor, currentMinor, currentPatch =
+        current:match("^(%d+)%.(%d+)%.(%d+)$")
+
+    if not candidateMajor or not currentMajor then return false end
+
+    local candidateParts = {
+        tonumber(candidateMajor),
+        tonumber(candidateMinor),
+        tonumber(candidatePatch)
+    }
+    local currentParts = {
+        tonumber(currentMajor),
+        tonumber(currentMinor),
+        tonumber(currentPatch)
+    }
+
+    for i = 1, 3 do
+        if candidateParts[i] ~= currentParts[i] then
+            return candidateParts[i] > currentParts[i]
+        end
+    end
+
+    return false
+end
+
 local function checkForUpdate()
     local remoteVersionStr, _ = httpGet(UPDATE_VERSION_URL)
-    local remoteVersion = remoteVersionStr:match("^%s*(%d+%.%d+%.%d+)%s*$")
+    local remoteVersion = remoteVersionStr
+        and remoteVersionStr:match("^%s*(%d+%.%d+%.%d+)%s*$")
 
     if DEBUG then
         print("Current version: " .. VERSION)
         print("Latest version: " .. (remoteVersion or "unknown"))
     end
 
-    if not remoteVersion or remoteVersion == VERSION then
+    if not remoteVersion or not isNewerVersion(remoteVersion, VERSION) then
         print("No updates available")
         return
     end
@@ -378,12 +539,16 @@ local STATE_WAIT_OUTPUT = 1
 local STATE_WAIT_OUTPUT_EMPTY = 2
 local STATE_WAIT_FABRICATOR = 3
 local STATE_WAIT_PLASMA = 4
+local STATE_WAIT_DRIVES_READY = 5
+local STATE_WAIT_DRIVES_RETURN = 6
 
 local STATE_DISPLAY = {
     [STATE_WAIT_OUTPUT] = "Waiting for exoticizer outputs",
     [STATE_WAIT_OUTPUT_EMPTY] = "Flushing outputs to main",
     [STATE_WAIT_FABRICATOR] = "Waiting for fabricator",
-    [STATE_WAIT_PLASMA] = "Waiting for plasma"
+    [STATE_WAIT_PLASMA] = "Waiting for plasma",
+    [STATE_WAIT_DRIVES_READY] = "Waiting for output drives",
+    [STATE_WAIT_DRIVES_RETURN] = "Returning output drives"
 }
 
 local QGP = {
@@ -430,6 +595,111 @@ local function checkOutputEmpty(module)
     end
 
     return true
+end
+
+local function outputDrivesAreResting(module, layout)
+    return #layout.errors == 0
+        and layout.total == module.outputDriveCount
+        and #layout.markerInput == 0
+        and #layout.markerOutput == 0
+        and #layout.mainInput == 0
+        and #layout.mainOutput == module.outputDriveCount
+end
+
+local function recoverOutputDrivesAtStartup(module)
+    local deadline = computer.uptime() + DRIVE_RECOVERY_TIMEOUT
+    local retryDelay = DRIVE_RESCAN_INITIAL_INTERVAL
+    local recovering = false
+    local lastLayout
+    local lastOutputError
+
+    while true do
+        local layout = scanOutputDriveLayout(module)
+        lastLayout = layout
+
+        local validLayout = #layout.errors == 0
+            and layout.total == module.outputDriveCount
+
+        if validLayout and outputDrivesAreResting(module, layout) then
+            if not recovering then return false end
+
+            local ok, outputEmpty = pcall(checkOutputEmpty, module)
+            if ok and outputEmpty then
+                print("Recovered " .. module.name
+                    .. " output drives after an interrupted transfer.")
+                return true
+            elseif ok then
+                lastOutputError = nil
+                moveDriveSlotsToFreeInputs(
+                    module.outputShuttle,
+                    module.outputShuttle.otherSide,
+                    module.outputShuttle.markerSide,
+                    layout.mainOutput,
+                    layout.markerInput
+                )
+            end
+
+            if not ok then
+                lastOutputError = tostring(outputEmpty)
+            end
+        elseif validLayout then
+            if not recovering then
+                recovering = true
+                print("Recovering " .. module.name
+                    .. " output drives from an interrupted transfer...")
+            end
+
+            local ok, outputEmpty = pcall(checkOutputEmpty, module)
+
+            if ok then
+                lastOutputError = nil
+
+                -- Cells that have finished filling can always be sent toward
+                -- main. Use currently-free input slots so a restart halfway
+                -- through a multi-cell transfer cannot cause a collision.
+                if #layout.markerOutput > 0 then
+                    moveDriveSlotsToFreeInputs(
+                        module.outputShuttle,
+                        module.outputShuttle.markerSide,
+                        module.outputShuttle.otherSide,
+                        layout.markerOutput,
+                        layout.mainInput
+                    )
+                end
+
+                -- If the output subnet still contains data, keep cycling any
+                -- cells that have made it back to main until the interrupted
+                -- flush is actually complete.
+                if not outputEmpty and #layout.mainOutput > 0 then
+                    moveDriveSlotsToFreeInputs(
+                        module.outputShuttle,
+                        module.outputShuttle.otherSide,
+                        module.outputShuttle.markerSide,
+                        layout.mainOutput,
+                        layout.markerInput
+                    )
+                end
+            else
+                lastOutputError = tostring(outputEmpty)
+            end
+        end
+
+        if computer.uptime() >= deadline then
+            local message = "timed out recovering " .. module.name
+                .. " output drives after " .. DRIVE_RECOVERY_TIMEOUT
+                .. " seconds; " .. describeOutputDriveLayout(module, lastLayout)
+
+            if lastOutputError then
+                message = message .. "; output subnet scan error="
+                    .. lastOutputError
+            end
+
+            error(message)
+        end
+
+        os.sleep(retryDelay)
+        retryDelay = math.min(retryDelay * 2, DRIVE_RESCAN_MAX_INTERVAL)
+    end
 end
 
 local function getPlasmaStock()
@@ -580,11 +850,11 @@ end
 local function flushOutputs(module)
     local drives = getDriveSlots(module.outputShuttle, module.outputShuttle.otherSide)
 
-    assert(
-        #drives == module.outputDriveCount,
-        "expected " .. module.outputDriveCount .. " " .. module.name
-            .. " output drives, found " .. #drives
-    )
+    if #drives ~= module.outputDriveCount then
+        local layout = scanOutputDriveLayout(module)
+        error("cannot start " .. module.name .. " output flush; "
+            .. describeOutputDriveLayout(module, layout))
+    end
 
     moveDriveSlots(
         module.outputShuttle,
@@ -595,15 +865,9 @@ local function flushOutputs(module)
 end
 
 local function finishFlushOutputs(module)
-    os.sleep(OUTPUT_SETTLE_TIME)
-
     local drives = getDriveSlots(module.outputShuttle, module.outputShuttle.markerSide)
 
-    assert(
-        #drives == module.outputDriveCount,
-        "expected " .. module.outputDriveCount .. " " .. module.name
-            .. " output drives to return, found " .. #drives
-    )
+    if #drives ~= module.outputDriveCount then return false end
 
     moveDriveSlots(
         module.outputShuttle,
@@ -611,6 +875,28 @@ local function finishFlushOutputs(module)
         module.outputShuttle.otherSide,
         drives
     )
+
+    return true
+end
+
+local function scheduleDriveRetry(module, timerField, description)
+    local now = computer.uptime()
+
+    if not module.driveWaitStartedAt then
+        module.driveWaitStartedAt = now
+        module.driveRetryDelay = DRIVE_RESCAN_INITIAL_INTERVAL
+    end
+
+    if now - module.driveWaitStartedAt >= DRIVE_RECOVERY_TIMEOUT then
+        local layout = scanOutputDriveLayout(module)
+        error("timed out waiting for " .. module.name .. " " .. description
+            .. " after " .. DRIVE_RECOVERY_TIMEOUT .. " seconds; "
+            .. describeOutputDriveLayout(module, layout))
+    end
+
+    local delay = module.driveRetryDelay or DRIVE_RESCAN_INITIAL_INTERVAL
+    module[timerField] = now + delay
+    module.driveRetryDelay = math.min(delay * 2, DRIVE_RESCAN_MAX_INTERVAL)
 end
 
 local function calculateQGPDemand(items, fluids)
@@ -720,7 +1006,16 @@ end
 -- ============================================================
 
 local function renderModule(module)
-    local status = module.enabled and STATE_DISPLAY[module.state] or "Disabled"
+    local status
+
+    if not module.enabled then
+        status = "Disabled"
+    elseif module.needsFreshChallenge and module.state == STATE_WAIT_OUTPUT then
+        status = "Recovered drives; request a new challenge"
+    else
+        status = STATE_DISPLAY[module.state] or "Starting"
+    end
+
     local text = module.name .. ": " .. status
     text = text:sub(1, DisplayWidth)
 
@@ -733,12 +1028,26 @@ local function setState(module, newState)
     if module.state == newState then return end
 
     module.state = newState
+    module.driveWaitStartedAt = nil
+    module.driveRetryDelay = nil
+    module.driveRescanAt = nil
 
     if newState == STATE_WAIT_OUTPUT
         or newState == STATE_WAIT_OUTPUT_EMPTY then
         module.outputRescanAt = computer.uptime() + OUTPUT_RESCAN_INTERVAL
     else
         module.outputRescanAt = nil
+    end
+
+    if newState == STATE_WAIT_DRIVES_READY
+        or newState == STATE_WAIT_DRIVES_RETURN then
+        local now = computer.uptime()
+        module.driveWaitStartedAt = now
+        module.driveRetryDelay = math.min(
+            DRIVE_RESCAN_INITIAL_INTERVAL * 2,
+            DRIVE_RESCAN_MAX_INTERVAL
+        )
+        module.driveRescanAt = now + DRIVE_RESCAN_INITIAL_INTERVAL
     end
 
     renderModule(module)
@@ -786,30 +1095,66 @@ updateSubscriptions = function()
     end
 end
 
+local function recordEvent(batch, eventName, sourceAddress)
+    if not eventName then return end
+
+    batch.types[eventName] = true
+
+    local sources = batch.sources[eventName]
+    if not sources then
+        sources = {}
+        batch.sources[eventName] = sources
+    end
+
+    -- A normal component signal always has a source address. Preserve a
+    -- source-less event as a wildcard so a malformed or synthetic signal
+    -- still causes a safe rescan rather than being ignored.
+    sources[sourceAddress or false] = true
+end
+
 local function pullDebounced(timeout)
-    local eventName
+    local batch = {types = {}, sources = {}}
+    local eventName, sourceAddress
 
     if timeout then
-        eventName = event.pull(timeout)
+        eventName, sourceAddress = event.pull(timeout)
     else
-        eventName = event.pull()
+        eventName, sourceAddress = event.pull()
     end
+
+    recordEvent(batch, eventName, sourceAddress)
 
     if eventName ~= "network_item_changed"
         and eventName ~= "network_fluid_changed" then
-        return eventName
+        return batch
     end
 
-    local deadline = computer.uptime() + 0.05
+    local deadline = computer.uptime() + EVENT_DEBOUNCE_TIME
 
     while true do
         local remaining = deadline - computer.uptime()
         if remaining <= 0 then break end
 
-        event.pull(remaining)
+        local nextEvent, nextSource = event.pull(remaining)
+        recordEvent(batch, nextEvent, nextSource)
     end
 
-    return eventName
+    return batch
+end
+
+local function hasInterfaceEvent(batch, eventName, interface)
+    if not batch or not batch.types[eventName] then return false end
+
+    local sources = batch.sources[eventName]
+    if not sources or sources[false] then return true end
+
+    local address = interface and interface.address
+    return not address or sources[address] == true
+end
+
+local function hasOutputEvent(batch, module)
+    return hasInterfaceEvent(batch, "network_item_changed", module.outputInterface)
+        or hasInterfaceEvent(batch, "network_fluid_changed", module.outputInterface)
 end
 
 -- ============================================================
@@ -938,23 +1283,45 @@ local function checkExoticizerCraft(module)
     module.exoticizerCraft = nil
 end
 
-local function advanceModule(module, eventName, plasmaStock)
+local function continueAfterOutputFlush(module, plasmaStock)
+    module.demand = calculatePlasmaDemand(
+        module,
+        module.cycleItems,
+        module.cycleFluids
+    )
+
+    module.cycleItems = nil
+    module.cycleFluids = nil
+    module.missingPlasma = getMissingPlasma(module.demand, plasmaStock)
+
+    if next(module.missingPlasma) == nil then
+        finishPlasmaWait(module)
+        return
+    end
+
+    setState(module, STATE_WAIT_FABRICATOR)
+    serviceFabricatorQueue()
+end
+
+local function advanceModule(module, eventBatch, plasmaStock)
     if not module.enabled then return end
 
     checkExoticizerCraft(module)
 
     if module.state == STATE_WAIT_OUTPUT then
-        if eventName
-            and eventName ~= "network_item_changed"
-            and eventName ~= "network_fluid_changed" then
-            return
-        end
+        if eventBatch and not hasOutputEvent(eventBatch, module) then return end
+
+        -- An event-driven scan is as useful as a timer-driven scan. Move the
+        -- fallback out so a timer does not immediately duplicate this work,
+        -- while still guaranteeing another check if no further event arrives.
+        module.outputRescanAt = computer.uptime() + OUTPUT_RESCAN_INTERVAL
 
         local items, fluids = checkForOutputs(module)
         if not items then return end
 
         module.cycleItems = items
         module.cycleFluids = fluids
+        module.needsFreshChallenge = nil
 
         setState(module, STATE_WAIT_OUTPUT_EMPTY)
         flushOutputs(module)
@@ -962,38 +1329,72 @@ local function advanceModule(module, eventName, plasmaStock)
     end
 
     if module.state == STATE_WAIT_OUTPUT_EMPTY then
-        if eventName
-            and eventName ~= "network_item_changed"
-            and eventName ~= "network_fluid_changed" then
-            return
-        end
+        if eventBatch and not hasOutputEvent(eventBatch, module) then return end
+
+        module.outputRescanAt = computer.uptime() + OUTPUT_RESCAN_INTERVAL
 
         if not checkOutputEmpty(module) then return end
 
-        finishFlushOutputs(module)
-
-        module.demand = calculatePlasmaDemand(
-            module,
-            module.cycleItems,
-            module.cycleFluids
-        )
-
-        module.cycleItems = nil
-        module.cycleFluids = nil
-        module.missingPlasma = getMissingPlasma(module.demand, plasmaStock)
-
-        if next(module.missingPlasma) == nil then
-            finishPlasmaWait(module)
+        if not finishFlushOutputs(module) then
+            setState(module, STATE_WAIT_DRIVES_READY)
             return
         end
 
-        setState(module, STATE_WAIT_FABRICATOR)
-        serviceFabricatorQueue()
+        setState(module, STATE_WAIT_DRIVES_RETURN)
+        return
+    end
+
+    if module.state == STATE_WAIT_DRIVES_READY then
+        -- Once the output network is confirmed empty, only the I/O Port
+        -- needs attention. Ignore unrelated network events and poll just the
+        -- output-subnet output slots on the dedicated retry timer.
+        if eventBatch then return end
+
+        if not finishFlushOutputs(module) then
+            scheduleDriveRetry(
+                module,
+                "driveRescanAt",
+                "output drives to finish filling"
+            )
+            return
+        end
+
+        setState(module, STATE_WAIT_DRIVES_RETURN)
+        return
+    end
+
+    if module.state == STATE_WAIT_DRIVES_RETURN then
+        -- Transposer/I/O Port movement does not provide a dependable event.
+        -- Only the dedicated retry timer may inspect this state, avoiding a
+        -- drive scan for unrelated network events.
+        if eventBatch then return end
+
+        local drives = getDriveSlots(
+            module.outputShuttle,
+            module.outputShuttle.otherSide
+        )
+
+        if #drives ~= module.outputDriveCount then
+            scheduleDriveRetry(
+                module,
+                "driveRescanAt",
+                "output drives to return to main"
+            )
+            return
+        end
+
+        continueAfterOutputFlush(module, plasmaStock)
         return
     end
 
     if module.state == STATE_WAIT_PLASMA then
-        if eventName ~= "network_fluid_changed" then return end
+        if not hasInterfaceEvent(
+            eventBatch,
+            "network_fluid_changed",
+            PlasmaMonitorInterface
+        ) then
+            return
+        end
 
         module.missingPlasma = getMissingPlasma(module.demand, plasmaStock)
 
@@ -1003,18 +1404,22 @@ local function advanceModule(module, eventName, plasmaStock)
     end
 end
 
-local function advanceQGP(eventName, plasmaStock)
-    advanceModule(QGP, eventName, plasmaStock)
+local function advanceQGP(eventBatch, plasmaStock)
+    advanceModule(QGP, eventBatch, plasmaStock)
 end
 
-local function advanceMagmatter(eventName, plasmaStock)
-    advanceModule(Magmatter, eventName, plasmaStock)
+local function advanceMagmatter(eventBatch, plasmaStock)
+    advanceModule(Magmatter, eventBatch, plasmaStock)
 end
 
-local function dispatchEvent(eventName)
+local function dispatchEvents(eventBatch)
     local plasmaStock
 
-    if eventName == "network_fluid_changed" then
+    if hasInterfaceEvent(
+        eventBatch,
+        "network_fluid_changed",
+        PlasmaMonitorInterface
+    ) then
         for _, module in ipairs(Modules) do
             if module.enabled and module.state == STATE_WAIT_PLASMA then
                 plasmaStock = getPlasmaStock()
@@ -1024,11 +1429,11 @@ local function dispatchEvent(eventName)
     end
 
     if ENABLE_QGP then
-        advanceQGP(eventName, plasmaStock)
+        advanceQGP(eventBatch, plasmaStock)
     end
 
     if ENABLE_MAGMATTER then
-        advanceMagmatter(eventName, plasmaStock)
+        advanceMagmatter(eventBatch, plasmaStock)
     end
 
     serviceFabricatorQueue()
@@ -1047,6 +1452,11 @@ local function getNextTimer()
             if module.outputRescanAt
                 and (not nextTimer or module.outputRescanAt < nextTimer) then
                 nextTimer = module.outputRescanAt
+            end
+
+            if module.driveRescanAt
+                and (not nextTimer or module.driveRescanAt < nextTimer) then
+                nextTimer = module.driveRescanAt
             end
         end
     end
@@ -1069,7 +1479,14 @@ local function handleTimers()
                 or module.state == STATE_WAIT_OUTPUT_EMPTY)
             and module.outputRescanAt
             and now >= module.outputRescanAt then
-            module.outputRescanAt = now + OUTPUT_RESCAN_INTERVAL
+            advanceModule(module)
+        end
+
+        if module.enabled
+            and (module.state == STATE_WAIT_DRIVES_READY
+                or module.state == STATE_WAIT_DRIVES_RETURN)
+            and module.driveRescanAt
+            and now >= module.driveRescanAt then
             advanceModule(module)
         end
     end
@@ -1091,32 +1508,7 @@ local function discoverModule(module)
     module.outputShuttle = findTransposerByMarkerSlot(module.outputMarkerSlot)
     assert(module.outputShuttle, "could not find " .. module.name .. " output transposer")
 
-    local markerDrives = getDriveSlots(
-        module.outputShuttle,
-        module.outputShuttle.markerSide
-    )
-
-    if #markerDrives > 0 then
-        moveDriveSlots(
-            module.outputShuttle,
-            module.outputShuttle.markerSide,
-            module.outputShuttle.otherSide,
-            markerDrives
-        )
-
-        os.sleep(OUTPUT_SETTLE_TIME)
-    end
-
-    local restingDrives = getDriveSlots(
-        module.outputShuttle,
-        module.outputShuttle.otherSide
-    )
-
-    assert(
-        #restingDrives == module.outputDriveCount,
-        "expected " .. module.outputDriveCount .. " " .. module.name
-            .. " output drives at startup, found " .. #restingDrives
-    )
+    module.needsFreshChallenge = recoverOutputDrivesAtStartup(module)
 
     module.inputPatternSize = getPatternSize(module.inputInterface)
 
@@ -1209,10 +1601,10 @@ while true do
         timeout = math.max(0, nextTimer - computer.uptime())
     end
 
-    local eventName = pullDebounced(timeout)
+    local eventBatch = pullDebounced(timeout)
 
-    if eventName == "network_item_changed"
-        or eventName == "network_fluid_changed" then
-        dispatchEvent(eventName)
+    if eventBatch.types.network_item_changed
+        or eventBatch.types.network_fluid_changed then
+        dispatchEvents(eventBatch)
     end
 end

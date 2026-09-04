@@ -294,7 +294,7 @@ end
 -- Networking & Auto updates
 -- ============================================================
 
-local VERSION = "1.3.6"
+local VERSION = "1.3.7"
 local UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/VERSION"
 local UPDATE_SCRIPT_URL = "https://raw.githubusercontent.com/Flouid/gtnh-gorge-controller/main/gorge-controller.lua"
 
